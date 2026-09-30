@@ -1,0 +1,77 @@
+name: release
+
+# Tag `luma-b<n>` (or run manually) to build sd-server + sd-cli
+# with the patch stack applied and publish the two LumaBrowser-consumable
+# release assets. The CUDA kernel compile across three archs is slow on
+# hosted runners (~1-2h) — this is a per-release build, not per-push CI.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'luma-b*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-cuda:
+    runs-on: windows-2022
+    steps:
+      # Supply-chain policy: every third-party action is pinned to a full
+      # commit SHA (tags are mutable — a moved tag is arbitrary code running
+      # with this repo's write token), and every direct download is verified
+      # against a recorded SHA-256 from the project's official release.
+      - name: Checkout patch repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install CUDA toolkit
+        # Downloads from developer.download.nvidia.com (NVIDIA's own CDN).
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          # 12.8 is the first toolkit that knows Blackwell (compute_120);
+          # 12.4 fails with "Unsupported gpu architecture 'compute_120'".
+          cuda: '12.8.1'
+          method: network
+          sub-packages: '["nvcc","cudart","cublas","cublas_dev","thrust","visual_studio_integration"]'
+
+      - name: Install ninja (official release, checksum-verified)
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip'
+          $sha = 'f550fec705b6d6ff58f2db3c374c2277a37691678d6aba463adcbb129108467a'
+          Invoke-WebRequest -Uri $url -OutFile ninja.zip
+          $got = (Get-FileHash ninja.zip -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $sha) { throw "ninja-win.zip checksum mismatch: $got" }
+          Expand-Archive ninja.zip -DestinationPath "$env:RUNNER_TEMP\ninja"
+          Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\ninja"
+
+      - name: Apply patch stack to pinned upstream
+        shell: pwsh
+        run: |
+          git config --global user.email "ci@lumabyte.com"
+          git config --global user.name "luma-sdcpp CI"
+          .\scripts\checkout.ps1
+
+      - name: Build and package
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -ne 'tag') { $tag = "manual-$($env:GITHUB_SHA.Substring(0,7))" }
+          .\scripts\build-windows-cuda.ps1 -Tag $tag -CudaPath $env:CUDA_PATH -Jobs ([Environment]::ProcessorCount)
+
+      - name: Upload artifacts (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: dist/*.zip
+
+      - name: Publish release (tags)
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" (Get-ChildItem dist\*.zip).FullName `
+            --title "${{ github.ref_name }}" `
+            --notes "Patched stable-diffusion.cpp build (upstream $(Get-Content UPSTREAM_REF)). See README for the patch stack."

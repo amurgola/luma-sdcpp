@@ -1,0 +1,3 @@
+# Patch files are byte-exact inputs to git am — never EOL-convert them.
+patches/** -text
+* text=auto

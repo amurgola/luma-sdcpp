@@ -1,0 +1,137 @@
+From d11d97f6ab7d75e0e02d5ae50281bce368cbd15c Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <admin@murgo.la>
+Date: Tue, 29 Sep 2026 22:37:42 -0400
+Subject: [PATCH] tensor: allocation-free index() and nearest interpolate
+
+Tensor::index(x, y, c, n) built a std::vector for every element it
+touched, and the image paths call it once per pixel per channel:
+sd_image_to_tensor, ImagePreprocessor::apply_transform and the nearest
+ops::interpolate together spent about 9 s of CPU per megapixel of input
+image before any GPU work, on every reference of every edit request.
+
+Keep the coordinates on the stack, and walk the nearest-neighbour
+interpolate with per-axis offset tables instead of two coordinate
+vectors per element. Bounds and rank checks are unchanged and the
+output is bit-identical; a three-image Qwen-Image 2.1 edit at 768x1344
+goes from 38.1 s to 12.3 s on an RTX 5090.
+---
+ src/core/tensor.hpp | 68 +++++++++++++++++++++++++++++++++------------
+ 1 file changed, 50 insertions(+), 18 deletions(-)
+
+diff --git a/src/core/tensor.hpp b/src/core/tensor.hpp
+index a925dbf..9a4f4c0 100644
+--- a/src/core/tensor.hpp
++++ b/src/core/tensor.hpp
+@@ -2,6 +2,7 @@
+ #define __SD_CORE_TENSOR_HPP__
+ 
+ #include <algorithm>
++#include <array>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
+@@ -292,21 +293,27 @@ namespace sd {
+         }
+ 
+         T& index(const std::vector<int64_t>& coord) {
+-            return data_.at(offset_of(coord));
++            return data_.at(offset_of(coord.data(), coord.size()));
+         }
+ 
+         const T& index(const std::vector<int64_t>& coord) const {
+-            return data_.at(offset_of(coord));
++            return data_.at(offset_of(coord.data(), coord.size()));
+         }
+ 
++        // The coordinates stay on the stack: per-element callers (image
++        // conversion and preprocessing loops) run this once per pixel and
++        // channel, where a heap-allocated coordinate vector per call dominates
++        // the runtime.
+         template <typename... Indices, typename = std::enable_if_t<(std::is_convertible_v<Indices, int64_t> && ...)>>
+         T& index(Indices... indices) {
+-            return index(std::vector<int64_t>{static_cast<int64_t>(indices)...});
++            const std::array<int64_t, sizeof...(Indices)> coord = {static_cast<int64_t>(indices)...};
++            return data_.at(offset_of(coord.data(), coord.size()));
+         }
+ 
+         template <typename... Indices, typename = std::enable_if_t<(std::is_convertible_v<Indices, int64_t> && ...)>>
+         const T& index(Indices... indices) const {
+-            return index(std::vector<int64_t>{static_cast<int64_t>(indices)...});
++            const std::array<int64_t, sizeof...(Indices)> coord = {static_cast<int64_t>(indices)...};
++            return data_.at(offset_of(coord.data(), coord.size()));
+         }
+ 
+         T& operator[](int64_t index) {
+@@ -318,10 +325,10 @@ namespace sd {
+         }
+ 
+     private:
+-        size_t offset_of(const std::vector<int64_t>& coord) const {
+-            if (coord.size() != shape_.size()) {
++        size_t offset_of(const int64_t* coord, size_t rank) const {
++            if (rank != shape_.size()) {
+                 tensor_throw_invalid_argument("Tensor index rank mismatch: coord_rank=" +
+-                                              std::to_string(coord.size()) + ", shape=" +
++                                              std::to_string(rank) + ", shape=" +
+                                               tensor_shape_to_string(shape_));
+             }
+             size_t offset = 0;
+@@ -1312,19 +1319,44 @@ namespace sd {
+             if (mode == InterpolateMode::Nearest ||
+                 mode == InterpolateMode::NearestExact ||
+                 !has_downsampling) {
+-                for (int64_t flat = 0; flat < output.numel(); ++flat) {
+-                    std::vector<int64_t> output_coord = tensor_unravel_index(flat, output.shape());
+-                    std::vector<int64_t> input_coord(static_cast<size_t>(input.dim()), 0);
+-                    for (size_t i = 0; i < static_cast<size_t>(input.dim()); ++i) {
+-                        if (mode == InterpolateMode::NearestExact) {
+-                            input_coord[i] = nearest_exact_interpolate_index(output_coord[i],
+-                                                                             input.shape()[i],
+-                                                                             output.shape()[i]);
+-                        } else {
+-                            input_coord[i] = output_coord[i] * input.shape()[i] / output.shape()[i];
++                // The source coordinate of an output element depends on one
++                // axis at a time, so each axis gets a table of source offsets
++                // and the elements are walked with an odometer (axis 0
++                // fastest, matching the flat layout). Same result as mapping
++                // every element through its own coordinate vectors, without
++                // the two allocations per element.
++                const size_t rank = static_cast<size_t>(input.dim());
++                std::vector<std::vector<int64_t>> source_offsets(rank);
++                int64_t input_stride = 1;
++                for (size_t i = 0; i < rank; ++i) {
++                    const int64_t input_size  = input.shape()[i];
++                    const int64_t output_size = output.shape()[i];
++                    source_offsets[i].resize(static_cast<size_t>(output_size));
++                    for (int64_t o = 0; o < output_size; ++o) {
++                        const int64_t source = mode == InterpolateMode::NearestExact
++                                                   ? nearest_exact_interpolate_index(o, input_size, output_size)
++                                                   : o * input_size / output_size;
++                        source_offsets[i][static_cast<size_t>(o)] = source * input_stride;
++                    }
++                    input_stride *= input_size;
++                }
++
++                std::vector<int64_t> coord(rank, 0);
++                const int64_t count = output.numel();
++                const T* src        = input.data();
++                T* dst              = output.data();
++                for (int64_t flat = 0; flat < count; ++flat) {
++                    int64_t offset = 0;
++                    for (size_t i = 0; i < rank; ++i) {
++                        offset += source_offsets[i][static_cast<size_t>(coord[i])];
++                    }
++                    dst[flat] = src[offset];
++                    for (size_t i = 0; i < rank; ++i) {
++                        if (++coord[i] < output.shape()[i]) {
++                            break;
+                         }
++                        coord[i] = 0;
+                     }
+-                    output[flat] = input.index(input_coord);
+                 }
+ 
+                 return output;
+-- 
+2.53.0.windows.2
+
