@@ -16,7 +16,9 @@ if (-not (Test-Path (Join-Path $work '.git'))) {
 }
 Push-Location $work
 try {
-  git am --abort 2>$null
+  # Only abort a half-applied stack that exists: `git am --abort 2>$null` writes to stderr when there is none,
+  # which Windows PowerShell 5.1 turns into a terminating error under 'Stop' (pwsh 7 does not).
+  if (Test-Path (Join-Path $work '.git\rebase-apply')) { git am --abort }
   git fetch origin
   git checkout --detach $Ref
   git clean -fd

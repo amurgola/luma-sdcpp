@@ -1,0 +1,61 @@
+From 17a87e76773ebb982d096e45611e3026e89ebee9 Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <admin@murgo.la>
+Date: Wed, 28 Oct 2026 19:26:54 -0400
+Subject: [PATCH] backend_fit: let auto-fit use an integrated GPU when there is
+ no discrete one
+
+ggml-cuda reports a device whose cudaDeviceProp.integrated is set as
+GGML_BACKEND_DEVICE_TYPE_IGPU. The RTX Spark's unified-memory Blackwell
+(Windows on Arm, sm_121) is one, as are the APUs the Vulkan backend lists.
+enumerate_gpu_devices() only took GGML_BACKEND_DEVICE_TYPE_GPU, so on those
+hosts auto-fit found no GPU, logged "auto-fit: no GPU devices; using the
+default backend" and never planned a split: --max-vram had no effect, and a
+model larger than the GPU's memory could not fall back to streaming its
+weights from RAM.
+
+Treat an IGPU as the GPU when no discrete GPU is present, which is the same
+GPU-then-IGPU order sd_backend_resolve_name() already uses for the default
+backend, so a host with both still fits on its discrete card only.
+
+On an RTX Spark N1X (Z-Image Turbo Q4_0, 512x512, 9 steps, seed 42):
+auto-fit now plans diffusion/te/vae on CUDA0 with a byte-identical image
+(6.9 s), and with --max-vram 4 it keeps the weights in RAM and streams them
+(8.8 s) instead of ignoring the budget.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/backend_fit.cpp | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/backend_fit.cpp b/src/core/backend_fit.cpp
+index 84667ef..7b04f64 100644
+--- a/src/core/backend_fit.cpp
++++ b/src/core/backend_fit.cpp
+@@ -130,11 +130,22 @@ namespace sd::backend_fit {
+     static std::vector<Device> enumerate_gpu_devices(const sd::ggml_graph_cut::MaxVramAssignment& budgets,
+                                                      bool include_other_devices) {
+         std::vector<Device> out;
++        // An integrated GPU (an APU, or a unified-memory part such as the RTX Spark's Blackwell, which ggml-cuda
++        // reports as IGPU) is the GPU when the host has no discrete one: the same GPU-then-IGPU order the default
++        // backend resolves with, so a host with both still fits on its discrete card only.
++        bool has_discrete_gpu = false;
++        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++            if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++                has_discrete_gpu = true;
++                break;
++            }
++        }
+         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+             const auto type        = ggml_backend_dev_type(dev);
+-            if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+-                (!include_other_devices || type == GGML_BACKEND_DEVICE_TYPE_CPU)) {
++            const bool gpu         = type == GGML_BACKEND_DEVICE_TYPE_GPU ||
++                             (!has_discrete_gpu && type == GGML_BACKEND_DEVICE_TYPE_IGPU);
++            if (!gpu && (!include_other_devices || type == GGML_BACKEND_DEVICE_TYPE_CPU)) {
+                 continue;
+             }
+             Device device;
+-- 
+2.56.0.windows.3
+

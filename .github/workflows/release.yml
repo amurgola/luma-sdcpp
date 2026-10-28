@@ -1,11 +1,19 @@
 name: release
 
 # Tag `luma-b<n>` (or run manually) to build sd-server + sd-cli
-# with the patch stack applied and publish the two LumaBrowser-consumable
-# release assets. The CUDA kernel compile across three archs is slow on
-# hosted runners (~1-2h) — this is a per-release build, not per-push CI.
+# with the patch stack applied and publish the LumaBrowser-consumable
+# release assets: an x64 CUDA 12 pair and a Windows on Arm CUDA 13 pair.
+# The x64 CUDA kernel compile across nine archs is slow on hosted runners
+# (~2h) — this is a per-release build, not per-push CI. A manual run can
+# build one target only and uploads the zips as workflow artifacts.
 on:
   workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Which builds to run'
+        type: choice
+        options: [all, x64, arm64]
+        default: all
   push:
     tags:
       - 'luma-b*'
@@ -15,6 +23,8 @@ permissions:
 
 jobs:
   windows-cuda:
+    # inputs.targets is empty on a tag push, so both builds run.
+    if: inputs.targets != 'arm64'
     runs-on: windows-2022
     steps:
       # Supply-chain policy: every third-party action is pinned to a full
@@ -59,19 +69,106 @@ jobs:
           if ("${{ github.ref_type }}" -ne 'tag') { $tag = "manual-$($env:GITHUB_SHA.Substring(0,7))" }
           .\scripts\build-windows-cuda.ps1 -Tag $tag -CudaPath $env:CUDA_PATH -Jobs ([Environment]::ProcessorCount)
 
-      - name: Upload artifacts (manual runs)
-        if: github.ref_type != 'tag'
+      - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: dist
+          name: dist-x64
           path: dist/*.zip
 
-      - name: Publish release (tags)
-        if: github.ref_type == 'tag'
+  windows-cuda-arm64:
+    # Windows on Arm (the RTX Spark's sm_121 Blackwell), built natively on an
+    # Arm runner: ggml only accepts MSVC for ARM with GGML_NATIVE=ON, which
+    # probes the build host's CPU features, and the runner's Neoverse N2
+    # (ARMv9.0) is a subset of the RTX Spark N1X's ARMv9.2 cores.
+    if: inputs.targets != 'x64'
+    runs-on: windows-11-arm
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install CUDA 13.4 for Windows ARM64 (NVIDIA redist, checksum-verified)
+        # Downloads from developer.download.nvidia.com (NVIDIA's own CDN); the
+        # SHA-256s are NVIDIA's own, from redistrib_13.4.3.json. nvcc is a native
+        # ARM64 binary; the cudart/cuBLAS archives carry lib\arm64 and bin\arm64.
         shell: pwsh
+        run: |
+          $base = 'https://developer.download.nvidia.com/compute/cuda/redist/'
+          $archives = @(
+            @("cuda_nvcc/windows-arm64/cuda_nvcc-windows-arm64-13.4.92-archive.zip", "8ca6e46052dba9e1a3e72d071ce83079e7edf70020f94eac54de55689b0d2141"),
+            @("cuda_crt/windows-arm64/cuda_crt-windows-arm64-13.4.92-archive.zip", "3fa09349f4af5a39ffb806ce48db9c406f81fcd3366e066fdca6eba97927764a"),
+            @("libnvvm/windows-arm64/libnvvm-windows-arm64-13.4.92-archive.zip", "3bd0c42bca5f16a6055b32a10535e48c23e8701eb9c9fbb7e6eff655841cfe9d"),
+            @("cccl/windows-arm64/cccl-windows-arm64-13.3.4.3.1-archive.zip", "e298fc4546a889a4d8329657eac567d93a082c0480d7c9b23690d28d8753d21d"),
+            @("cuda_cudart/windows-arm64/cuda_cudart-windows-arm64-13.4.92-archive.zip", "d3cec2717ba3c2c714c5869a5374365d087c698d87c0ddd3bd41715447112891"),
+            @("libcublas/windows-arm64/libcublas-windows-arm64-13.8.0.4-archive.zip", "ec79698528f64361a370d1b0254a927e369b57525831fadcb2cdb7732d8ab621"),
+            @("cuda_profiler_api/windows-arm64/cuda_profiler_api-windows-arm64-13.4.92-archive.zip", "feb00b603591129ba12ed768edeb9ae671a051b2d9207fff842f7aa83b19d9cb"),
+            @("cuda_nvrtc/windows-arm64/cuda_nvrtc-windows-arm64-13.4.92-archive.zip", "fee31ad3a953e56a52015f29c237fb15bcd2ddc14676c1aec03a9384aa807383")
+          )
+          $cuda = Join-Path $env:RUNNER_TEMP 'cuda-13.4-arm64'
+          New-Item -ItemType Directory -Force $cuda | Out-Null
+          foreach ($a in $archives) {
+            $zip = Join-Path $env:RUNNER_TEMP (Split-Path $a[0] -Leaf)
+            Invoke-WebRequest -Uri ($base + $a[0]) -OutFile $zip
+            $got = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $a[1]) { throw "$(Split-Path $a[0] -Leaf) checksum mismatch: $got" }
+            # Each archive holds one top folder (<name>-archive\{bin,include,lib}); merge its contents.
+            $stage = Join-Path $env:RUNNER_TEMP ('x-' + [IO.Path]::GetFileNameWithoutExtension($zip))
+            Expand-Archive $zip -DestinationPath $stage -Force
+            Copy-Item (Join-Path (Get-ChildItem $stage -Directory | Select-Object -First 1).FullName '*') $cuda -Recurse -Force
+          }
+          & (Join-Path $cuda 'bin\nvcc.exe') --version
+          Add-Content $env:GITHUB_ENV "CUDA_ARM64_PATH=$cuda"
+
+      - name: Install ninja (official release, checksum-verified)
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-winarm64.zip'
+          $sha = '79c96a50e0deafec212cfa85aa57c6b74003f52d9d1673ddcd1eab1c958c5900'
+          Invoke-WebRequest -Uri $url -OutFile ninja.zip
+          $got = (Get-FileHash ninja.zip -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $sha) { throw "ninja-winarm64.zip checksum mismatch: $got" }
+          Expand-Archive ninja.zip -DestinationPath "$env:RUNNER_TEMP\ninja"
+          Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\ninja"
+
+      - name: Apply patch stack to pinned upstream
+        shell: pwsh
+        run: |
+          git config --global user.email "ci@lumabyte.com"
+          git config --global user.name "luma-sdcpp CI"
+          .\scripts\checkout.ps1
+
+      - name: Build and package
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -ne 'tag') { $tag = "manual-$($env:GITHUB_SHA.Substring(0,7))" }
+          .\scripts\build-windows-cuda-arm64.ps1 -Tag $tag -CudaPath $env:CUDA_ARM64_PATH -Jobs ([Environment]::ProcessorCount)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-arm64
+          path: dist/*.zip
+
+  publish:
+    # One release from both builds, so the two jobs never race to create it.
+    if: github.ref_type == 'tag'
+    needs: [windows-cuda, windows-cuda-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" (Get-ChildItem dist\*.zip).FullName `
-            --title "${{ github.ref_name }}" `
-            --notes "Patched stable-diffusion.cpp build (upstream $(Get-Content UPSTREAM_REF)). See README for the patch stack."
+          gh release create "${{ github.ref_name }}" dist/*.zip \
+            --title "${{ github.ref_name }}" \
+            --notes "Patched stable-diffusion.cpp build (upstream $(head -n 1 UPSTREAM_REF)). Windows x64 (CUDA 12) and Windows on Arm (CUDA 13, RTX Spark). See README for the patch stack."
