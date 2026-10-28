@@ -126,6 +126,18 @@ jobs:
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          Write-Host "vswhere present: $(Test-Path $vswhere)"
+          if (Test-Path $vswhere) {
+            Write-Host '--- vswhere -all -prerelease -products *:'
+            & $vswhere -all -prerelease -products * -format text | Select-String 'installationPath|installationVersion|productId|isComplete|state' | ForEach-Object { Write-Host "  $_" }
+          }
+          Write-Host '--- Visual Studio folders on disk:'
+          foreach ($root in "$env:ProgramFiles\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio") {
+            Get-ChildItem $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "  $($_.FullName): $((Get-ChildItem $_.FullName -Directory -ErrorAction SilentlyContinue).Name -join ', ')"
+            }
+          }
+          Get-ChildItem "$env:ProgramFiles\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\*\*\cl.exe" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  cl: $($_.FullName)" }
           $vs = & $vswhere -products * -version '[17.0,18.0)' -property installationPath | Select-Object -First 1
           if (-not $vs) { throw 'No Visual Studio 2022 on this runner.' }
           Write-Host "VS 2022 at $vs"
