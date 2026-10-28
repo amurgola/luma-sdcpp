@@ -118,6 +118,36 @@ jobs:
           & (Join-Path $cuda 'bin\nvcc.exe') --version
           Add-Content $env:GITHUB_ENV "CUDA_ARM64_PATH=$cuda"
 
+      - name: Ensure VS 2022 ARM64 C++ tools
+        # The windows-11-arm image ships VS 2022 Enterprise but does not list its
+        # components, and on first run vswhere found no VC.Tools.ARM64. Log what
+        # MSVC host/target toolsets exist, then add the component through the
+        # runner's own VS installer (Microsoft's signed channel) if it is missing.
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -products * -version '[17.0,18.0)' -property installationPath | Select-Object -First 1
+          if (-not $vs) { throw 'No Visual Studio 2022 on this runner.' }
+          Write-Host "VS 2022 at $vs"
+          foreach ($msvc in Get-ChildItem "$vs\VC\Tools\MSVC" -Directory -ErrorAction SilentlyContinue) {
+            foreach ($host_ in Get-ChildItem "$($msvc.FullName)\bin" -Directory) {
+              Write-Host "  MSVC $($msvc.Name) $($host_.Name): $((Get-ChildItem $host_.FullName -Directory).Name -join ', ')"
+            }
+          }
+          $arm64 = & $vswhere -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if ($arm64) { Write-Host 'VC.Tools.ARM64 present'; exit 0 }
+          Write-Host 'Adding Microsoft.VisualStudio.Component.VC.Tools.ARM64 ...'
+          $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+            'modify', '--installPath', "`"$vs`"", '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
+            '--quiet', '--norestart', '--nocache')
+          # 3010 is "succeeded, reboot recommended", which a build does not need.
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "VS installer exited $($p.ExitCode)" }
+          if (-not (& $vswhere -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath)) {
+            throw 'VC.Tools.ARM64 still missing after the VS installer ran.'
+          }
+          Write-Host 'VC.Tools.ARM64 installed'
+
       - name: Install ninja (official release, checksum-verified)
         shell: pwsh
         run: |
