@@ -118,6 +118,37 @@ jobs:
           & (Join-Path $cuda 'bin\nvcc.exe') --version
           Add-Content $env:GITHUB_ENV "CUDA_ARM64_PATH=$cuda"
 
+      - name: Install VS 2022 Build Tools with ARM64 C++ (Microsoft-signed bootstrapper)
+        # windows-11-arm ships VS 2026 (18.x) only, whatever its image README
+        # says. The build is proven with the VS 2022 (17.x) toolset, the same
+        # one the x64 job uses with nvcc, so install VS 2022 Build Tools beside
+        # it. aka.ms serves a moving bootstrapper, so instead of a pinned
+        # SHA-256 it must carry a valid Authenticode signature from Microsoft.
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $have = { & $vswhere -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath }
+          & $vswhere -all -prerelease -products * -format text | Select-String 'installationPath|installationVersion' | ForEach-Object { Write-Host "  $_" }
+          if (& $have) { Write-Host 'VS 2022 with VC.Tools.ARM64 already present'; exit 0 }
+          $boot = Join-Path $env:RUNNER_TEMP 'vs_BuildTools.exe'
+          Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vs_BuildTools.exe' -OutFile $boot
+          $sig = Get-AuthenticodeSignature $boot
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            throw "vs_BuildTools.exe signature check failed: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          }
+          Write-Host "bootstrapper signed by: $($sig.SignerCertificate.Subject)"
+          $p = Start-Process -FilePath $boot -Wait -PassThru -ArgumentList @(
+            '--quiet', '--wait', '--norestart', '--nocache',
+            '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
+            '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.26100')
+          # 3010 is "succeeded, reboot recommended", which a build does not need.
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "VS Build Tools installer exited $($p.ExitCode)" }
+          $vs = & $have
+          if (-not $vs) { throw 'VS 2022 VC.Tools.ARM64 still missing after the installer ran.' }
+          Write-Host "VS 2022 Build Tools with ARM64 C++ at $vs"
+          Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostarm64\arm64\cl.exe" | ForEach-Object { Write-Host "  cl: $($_.FullName)" }
+
       - name: Install ninja (official release, checksum-verified)
         shell: pwsh
         run: |
