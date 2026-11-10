@@ -19,7 +19,6 @@ any work.
 | # | Patch | Status |
 |---|---|---|
 | 0001 | `Tensor::index()` without a heap allocation per element, and a nearest-neighbour `interpolate` that walks per-axis offset tables instead of two coordinate vectors per element | upstream candidate |
-| 0002 | auto-fit treats an integrated GPU as the GPU when there is no discrete one (the RTX Spark's unified-memory Blackwell, APUs), so `--max-vram` and RAM-streamed weights work there | upstream candidate |
 
 `Tensor::index(x, y, c, n)` built a `std::vector` for every element it
 touched, and the image paths call it once per pixel per channel
@@ -39,14 +38,9 @@ LoRA, 6 steps, RTX 5090, Windows 11), same seed:
 
 The output is pixel-identical to upstream (zero differing channels).
 
-ggml-cuda reports a GPU whose CUDA properties say `integrated` as
-`GGML_BACKEND_DEVICE_TYPE_IGPU`; the RTX Spark N1X is one. Upstream's auto-fit
-only counts `GPU` devices, so on those hosts it logged "no GPU devices", ran
-everything on the default backend and ignored `--max-vram`. 0002 counts an
-IGPU when no discrete GPU is present, the order the default backend already
-uses. On an RTX Spark N1X (Z-Image Turbo Q4_0, 512x512, 9 steps): auto-fit now
-plans all three models on CUDA0 with a byte-identical image (6.9 s), and with
-`--max-vram 4` streams the weights from RAM (8.8 s).
+Former patch 0002 (auto-fit using an integrated GPU such as the RTX Spark N1X
+when there is no discrete one) was dropped at `luma-b4`: upstream's auto-fit
+now accepts `GGML_BACKEND_DEVICE_TYPE_IGPU` devices itself.
 
 ## Layout
 

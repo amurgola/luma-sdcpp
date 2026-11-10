@@ -1,4 +1,4 @@
-From d11d97f6ab7d75e0e02d5ae50281bce368cbd15c Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Andrew Murgola <admin@murgo.la>
 Date: Tue, 29 Sep 2026 22:37:42 -0400
 Subject: [PATCH] tensor: allocation-free index() and nearest interpolate
@@ -19,7 +19,7 @@ goes from 38.1 s to 12.3 s on an RTX 5090.
  1 file changed, 50 insertions(+), 18 deletions(-)
 
 diff --git a/src/core/tensor.hpp b/src/core/tensor.hpp
-index a925dbf..9a4f4c0 100644
+index 715068c..4704884 100644
 --- a/src/core/tensor.hpp
 +++ b/src/core/tensor.hpp
 @@ -2,6 +2,7 @@
@@ -30,7 +30,7 @@ index a925dbf..9a4f4c0 100644
  #include <cmath>
  #include <cstdint>
  #include <cstdio>
-@@ -292,21 +293,27 @@ namespace sd {
+@@ -306,21 +307,27 @@ namespace sd {
          }
  
          T& index(const std::vector<int64_t>& coord) {
@@ -62,7 +62,7 @@ index a925dbf..9a4f4c0 100644
          }
  
          T& operator[](int64_t index) {
-@@ -318,10 +325,10 @@ namespace sd {
+@@ -332,10 +339,10 @@ namespace sd {
          }
  
      private:
@@ -76,7 +76,7 @@ index a925dbf..9a4f4c0 100644
                                                tensor_shape_to_string(shape_));
              }
              size_t offset = 0;
-@@ -1312,19 +1319,44 @@ namespace sd {
+@@ -1328,19 +1335,44 @@ namespace sd {
              if (mode == InterpolateMode::Nearest ||
                  mode == InterpolateMode::NearestExact ||
                  !has_downsampling) {
@@ -132,6 +132,3 @@ index a925dbf..9a4f4c0 100644
                  }
  
                  return output;
--- 
-2.53.0.windows.2
-
