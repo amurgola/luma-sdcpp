@@ -50,6 +50,8 @@ patches/NNNN-*.patch            git format-patch files, applied in order with gi
 scripts/checkout.ps1            clone upstream @ UPSTREAM_REF (with submodules) into work/ and apply the stack
 scripts/build-windows-cuda.ps1        build sd-server + sd-cli (x64, CUDA 12) and package the release zips
 scripts/build-windows-cuda-arm64.ps1  the same for Windows on Arm (CUDA 13, RTX Spark), built natively on ARM64
+scripts/checkout.sh                   bash twin of checkout.ps1, for the Linux build
+scripts/build-linux-cuda-arm64.sh     the same for Linux arm64 (CUDA 13), built natively on aarch64
 .github/workflows/release.yml         tag-triggered CI release build
 ```
 
@@ -88,6 +90,25 @@ so far) and with `GGML_NATIVE=ON`, which ggml requires for MSVC on ARM.
 Keep the repo in a short path such as `C:\lsb`: upstream's submodules nest
 deep enough to pass Windows' 260-character limit from a long one.
 
+## Building locally (Linux arm64)
+
+Prereqs: an aarch64 host, git, cmake + ninja, gcc-14/g++-14 and a CUDA 13.x
+toolkit. NVIDIA's `nvidia/cuda:13.5.0-devel-ubuntu24.04` image plus
+`apt-get install git ca-certificates build-essential cmake ninja-build gcc-14 g++-14`
+is exactly what the workflow uses.
+
+```bash
+bash scripts/checkout.sh
+bash scripts/build-linux-cuda-arm64.sh -t local -a 121a-real   # DGX Spark only; drop -a for the release arch set
+# dist/sd-local-bin-linux-cuda13-arm64.tar.gz (+ cudart tarball)
+```
+
+The build follows ggml-org's own arm64 CUDA release recipe: per-microarch CPU
+backends chosen at load time (`GGML_CPU_ALL_VARIANTS`, which needs gcc-14 for
+the armv9.2 `sme` variant), an `$ORIGIN` rpath so the shared libraries resolve
+beside the binaries, and ggml's default CUDA architecture set unless `-a`
+narrows it. Building in the Ubuntu 24.04 image makes glibc 2.39 the floor.
+
 ## Releases and LumaBrowser integration
 
 Release assets deliberately match leejet's naming so LumaBrowser's runtime
@@ -98,12 +119,14 @@ sd-<tag>-bin-win-cuda12-x64.zip       sd-server, sd-cli, ggml + stable-diffusion
 cudart-sd-bin-win-cu12-x64.zip        CUDA runtime DLLs (cudart, cublas, cublasLt)
 sd-<tag>-bin-win-cuda13-arm64.zip     the same, Windows on Arm (CUDA 13)
 cudart-sd-bin-win-cu13-arm64.zip      CUDA 13 ARM64 runtime DLLs
+sd-<tag>-bin-linux-cuda13-arm64.tar.gz   sd-server, sd-cli and their shared libs, Linux arm64 (CUDA 13)
+cudart-sd-bin-linux-cu13-arm64.tar.gz    CUDA 13 runtime libs (libcudart, libcublas, libcublasLt)
 ```
 
-Tag `luma-b<n>` to publish a release from CI: both builds run, and a final
-job publishes one release with all four zips. A manual run (Actions, "Run
-workflow") can build `x64`, `arm64` or `all`, and uploads the zips as
-workflow artifacts instead. LumaBrowser lists this feed as
+Tag `luma-b<n>` to publish a release from CI: all three builds run, and a
+final job publishes one release with the six archives. A manual run (Actions,
+"Run workflow") can build `x64`, `arm64`, `linux-arm64` or `all`, and uploads
+the archives as workflow artifacts instead. LumaBrowser lists this feed as
 the "stable-diffusion.cpp (LumaByte)" runtime under Setup.
 
 ## License

@@ -2,7 +2,8 @@ name: release
 
 # Tag `luma-b<n>` (or run manually) to build sd-server + sd-cli
 # with the patch stack applied and publish the LumaBrowser-consumable
-# release assets: an x64 CUDA 12 pair and a Windows on Arm CUDA 13 pair.
+# release assets: a Windows x64 CUDA 12 pair, a Windows on Arm CUDA 13 pair
+# and a Linux arm64 CUDA 13 pair.
 # The x64 CUDA kernel compile across nine archs is slow on hosted runners
 # (~2h) — this is a per-release build, not per-push CI. A manual run can
 # build one target only and uploads the zips as workflow artifacts.
@@ -12,7 +13,7 @@ on:
       targets:
         description: 'Which builds to run'
         type: choice
-        options: [all, x64, arm64]
+        options: [all, x64, arm64, linux-arm64]
         default: all
   push:
     tags:
@@ -23,8 +24,8 @@ permissions:
 
 jobs:
   windows-cuda:
-    # inputs.targets is empty on a tag push, so both builds run.
-    if: inputs.targets != 'arm64'
+    # inputs.targets is empty on a tag push, so every build runs.
+    if: inputs.targets == '' || inputs.targets == 'all' || inputs.targets == 'x64'
     runs-on: windows-2022
     steps:
       # Supply-chain policy: every third-party action is pinned to a full
@@ -80,7 +81,7 @@ jobs:
     # Arm runner: ggml only accepts MSVC for ARM with GGML_NATIVE=ON, which
     # probes the build host's CPU features, and the runner's Neoverse N2
     # (ARMv9.0) is a subset of the RTX Spark N1X's ARMv9.2 cores.
-    if: inputs.targets != 'x64'
+    if: inputs.targets == '' || inputs.targets == 'all' || inputs.targets == 'arm64'
     runs-on: windows-11-arm
     steps:
       - name: Checkout patch repo
@@ -180,10 +181,52 @@ jobs:
           name: dist-arm64
           path: dist/*.zip
 
+  linux-cuda-arm64:
+    # Linux on Arm with an NVIDIA GPU (DGX Spark, Jetson, Arm servers), built
+    # natively on an Arm runner inside NVIDIA's CUDA devel image: the same
+    # recipe as ggml-org's ubuntu-cuda arm64 release build. Ubuntu 24.04 sets
+    # the glibc floor (2.39).
+    if: inputs.targets == '' || inputs.targets == 'all' || inputs.targets == 'linux-arm64'
+    runs-on: ubuntu-24.04-arm
+    # Docker Hub (NVIDIA's official image), pinned to the linux/arm64 manifest
+    # digest of the 13.5.0-devel-ubuntu24.04 tag: a tag alone is mutable.
+    container: nvidia/cuda:13.5.0-devel-ubuntu24.04@sha256:b3334ee11120210fb23887a797905003c170b5566101931d99c19413ed32b80d
+    steps:
+      # The image has no git, and checkout wants a real one. Everything here
+      # comes from Ubuntu's signed archive. gcc-14: GCC 13 does not know the
+      # 'sme' feature ggml's armv9.2 CPU variant is compiled with.
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential cmake ninja-build gcc-14 g++-14
+
+      - name: Checkout patch repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Apply patch stack to pinned upstream
+        shell: bash
+        run: |
+          git config --global user.email "ci@lumabyte.com"
+          git config --global user.name "luma-sdcpp CI"
+          bash scripts/checkout.sh
+
+      - name: Build and package
+        shell: bash
+        run: |
+          tag="${{ github.ref_name }}"
+          if [ "${{ github.ref_type }}" != 'tag' ]; then tag="manual-${GITHUB_SHA:0:7}"; fi
+          bash scripts/build-linux-cuda-arm64.sh -t "$tag" -j "$(nproc)"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-linux-arm64
+          path: dist/*.tar.gz
+
   publish:
-    # One release from both builds, so the two jobs never race to create it.
+    # One release from every build, so the jobs never race to create it.
     if: github.ref_type == 'tag'
-    needs: [windows-cuda, windows-cuda-arm64]
+    needs: [windows-cuda, windows-cuda-arm64, linux-cuda-arm64]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout patch repo
@@ -200,6 +243,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/*.zip \
+          gh release create "${{ github.ref_name }}" dist/*.zip dist/*.tar.gz \
             --title "${{ github.ref_name }}" \
-            --notes "Patched stable-diffusion.cpp build (upstream $(head -n 1 UPSTREAM_REF)). Windows x64 (CUDA 12) and Windows on Arm (CUDA 13, RTX Spark). See README for the patch stack."
+            --notes "Patched stable-diffusion.cpp build (upstream $(head -n 1 UPSTREAM_REF)). Windows x64 (CUDA 12), Windows on Arm (CUDA 13, RTX Spark) and Linux arm64 (CUDA 13). See README for the patch stack."
