@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Fri, 13 Nov 2026 00:11:53 -0800
+Subject: [PATCH 2/4] Wan VAE: run the uncached first frame of a causal conv3d
+ as a conv2d with the last temporal tap (Qwen-Image VAE decode 2.2-2.4x on
+ CPU, 1.5x on T4) (#82)
+
+The causal left pad of a single uncached frame is all zeros, so only w[:, :, kd - 1] meets real data. This
+generalises the depth-1 collapse to kd > 1: every Qwen-Image / 2512 / Edit / Layered decode and encode and chunk 0
+of each Wan-lineage video run a third of the conv FLOPs, and Metal skips its direct conv_3d fallback.
+
+Qwen-Image-2512 VAE, 512 px decode, base -> head: 26.1 -> 11.8 s (Xeon 8370C, 4 vCPU), 24.8 -> 10.2 s
+(Neoverse N2, 4 cores), 44.0 -> 19.4 s (M1 runner, 3 cores, CPU backend); 1024 px on a T4 1.74 -> 1.18 s.
+Encode 2.3-2.6x on CPU, 1.48x on T4; 9-17 frame video decode 2.5-8% faster. Peak RSS 0.78 -> 0.60 GB at 512 px.
+Numerically equivalent (dropped terms are exact zeros; GEMM reduction order changes): PSNR 92 dB against base,
+and base and head are equally close to an fp32 diffusers decode (82.68 / 82.67 dB).
+SD_VAE_FRAME_COLLAPSE=0 keeps the full conv_3d (bit-identical to base on CPU and CUDA).
+---
+ src/model/vae/wan_vae.hpp | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/src/model/vae/wan_vae.hpp b/src/model/vae/wan_vae.hpp
+index d44fe92..a3b2fd0 100644
+--- a/src/model/vae/wan_vae.hpp
++++ b/src/model/vae/wan_vae.hpp
+@@ -86,7 +86,39 @@ namespace WAN {
+                 lp2 -= (int)cache_x->ne[2];
+             }
+ 
++            // One frame whose causal left pad is all zeros (no cache) meets only the last temporal tap: the
++            // other taps multiply the zero frames. That is a 2D conv with w[:, :, kd - 1], kd times fewer
++            // FLOPs (first frame of every video chunk 0, every image decode / encode). Backends without
++            // im2col_3d (Metal) otherwise fall back to a much slower direct conv_3d.
++            // SD_VAE_FRAME_COLLAPSE=0 keeps the full conv_3d for kernels deeper than one frame.
++            static const bool collapse_off = [] {
++                const char* env = getenv("SD_VAE_FRAME_COLLAPSE");
++                return env != nullptr && std::string(env) == "0";
++            }();
++            const int64_t kd    = w->ne[2];
++            const bool collapse = (kd == 1 || !collapse_off) && x->ne[2] == 1 && x->ne[3] == in_channels &&
++                                  rp2 == 0 && lp2 == (kd - 1) * std::get<0>(dilation);
++            if (collapse) {
++                lp2 = 0;
++            }
+             x = ggml_ext_pad_ext(ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
++            if (collapse) {
++                if (!ggml_is_contiguous(x)) {
++                    x = ggml_cont(ctx->ggml_ctx, x);
++                }
++                ggml_tensor* wt = w;
++                if (kd > 1) {
++                    wt = ggml_cont(ctx->ggml_ctx, ggml_view_4d(ctx->ggml_ctx, w, w->ne[0], w->ne[1], 1, w->ne[3],
++                                                               w->nb[1], w->nb[2], w->nb[3], (size_t)(kd - 1) * w->nb[2]));
++                }
++                ggml_tensor* x2 = ggml_reshape_4d(ctx->ggml_ctx, x, x->ne[0], x->ne[1], in_channels, 1);
++                ggml_tensor* w2 = ggml_reshape_4d(ctx->ggml_ctx, wt, wt->ne[0], wt->ne[1], in_channels, out_channels);
++                x2              = ggml_ext_conv_2d(ctx, x2, w2, b,
++                                                   std::get<2>(stride), std::get<1>(stride), 0, 0,
++                                                   std::get<2>(dilation), std::get<1>(dilation),
++                                                   ctx->conv2d_direct_enabled, false, false, scale);
++                return ggml_reshape_4d(ctx->ggml_ctx, x2, x2->ne[0], x2->ne[1], 1, out_channels);
++            }
+             return ggml_ext_conv_3d(ctx, x, w, b, in_channels,
+                                     std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
+                                     0, 0, 0,

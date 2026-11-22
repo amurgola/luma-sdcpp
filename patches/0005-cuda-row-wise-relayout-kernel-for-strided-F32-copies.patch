@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <andy@murgo.la>
+Date: Sun, 22 Nov 2026 17:31:53 -0500
+Subject: [PATCH 4/4] cuda: row-wise relayout kernel for strided F32 copies and
+ casts
+
+Registers an extension kernel for CPY and CONT nodes whose source is a strided F32 view with a contiguous
+innermost dimension (the permuted head layouts around attention) and for F32 -> F16 casts. One warp owns one
+source row, so reads and writes are coalesced. The generic copy kernel maps single elements and ran at about a
+quarter of memory bandwidth on these shapes: 133 us -> 20 us for a [128, 4032, 16] cast and 132 us -> 24 us for
+the permuted copy on an RTX 5090. Bit-identical output.
+---
+ src/core/cuda/rope.cu | 80 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 80 insertions(+)
+
+diff --git a/src/core/cuda/rope.cu b/src/core/cuda/rope.cu
+index c012c40..f465b13 100644
+--- a/src/core/cuda/rope.cu
++++ b/src/core/cuda/rope.cu
+@@ -356,6 +356,73 @@ namespace SD_CUDA_NAMESPACE {
+         return error == cuda_success ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+     }
+ 
++    // Copies or casts a strided F32 source (the permuted views around attention) into contiguous F32 / F16 storage.
++    // One warp owns one contiguous source row, so reads and writes are both coalesced; the generic copy kernel maps
++    // single elements and runs far below memory bandwidth on these shapes.
++    template <typename T>
++    static __global__ void relayout_rows(const float* x, T* dst, int64_t width, int64_t ne1, int64_t ne2, int64_t rows,
++                                         int64_t nb1, int64_t nb2, int64_t nb3) {
++        const int lane    = threadIdx.x;
++        const int64_t row = int64_t(blockIdx.x) * blockDim.y + threadIdx.y;
++        if (row >= rows) {
++            return;
++        }
++        const int64_t i1   = row % ne1;
++        const int64_t rest = row / ne1;
++        const int64_t i2   = rest % ne2;
++        const int64_t i3   = rest / ne2;
++        const float* x_row = x + i1 * nb1 + i2 * nb2 + i3 * nb3;
++        T* out             = dst + row * width;
++        for (int64_t col = lane; col < width; col += 32) {
++            if constexpr (std::is_same<T, half>::value) {
++                out[col] = __float2half_rn(x_row[col]);
++            } else {
++                out[col] = x_row[col];
++            }
++        }
++    }
++
++    static bool relayout_supports(ggml_backend_dev_t, const ggml_tensor* node, void*) {
++        static const bool disabled = [] {const char* value=std::getenv("GGML_CUDA_DISABLE_FUSION"); return value && std::atoi(value)!=0; }();
++        if (disabled || (node->op != GGML_OP_CPY && node->op != GGML_OP_CONT))
++            return false;
++        const auto* x = node->src[0];
++        if (!x || (node->op == GGML_OP_CPY && node->src[1] != node))
++            return false;
++        // A contiguous F32 -> F32 copy is a plain memcpy already.
++        if (x->type != GGML_TYPE_F32 || (node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_F16) ||
++            !ggml_are_same_shape(x, node) || !ggml_is_contiguous(node) || (ggml_is_contiguous(x) && node->type == GGML_TYPE_F32))
++            return false;
++        // One warp per row: the innermost dimension must be contiguous in the source and worth a warp.
++        if (x->ne[0] < 32 || x->nb[0] != sizeof(float) || x->nb[1] % sizeof(float) || x->nb[2] % sizeof(float) || x->nb[3] % sizeof(float))
++            return false;
++        return (ggml_nelements(x) / x->ne[0] + 7) / 8 <= INT_MAX;
++    }
++
++    static ggml_status relayout_prepare(ggml_backend_t, ggml_tensor* const*, int, void**, size_t* workspace, void*) {
++        *workspace = 0;
++        return GGML_STATUS_SUCCESS;
++    }
++
++    static ggml_status relayout_execute(const ggml_ext_execution_context* execution, ggml_tensor* const* nodes, int, void*, void*) {
++        ggml_ext_gpu_context context;
++        if (!cuda_context(execution->backend, &context))
++            return GGML_STATUS_FAILED;
++        auto stream        = static_cast<CUDAStream>(context.stream);
++        auto* dst          = nodes[0];
++        const auto* x      = dst->src[0];
++        const int64_t rows = ggml_nelements(x) / x->ne[0];
++        const auto blocks  = static_cast<unsigned int>((rows + 7) / 8);
++        if (dst->type == GGML_TYPE_F16) {
++            relayout_rows<half><<<blocks, dim3(32, 8), 0, stream>>>(static_cast<const float*>(x->data), static_cast<half*>(dst->data),
++                                                                    x->ne[0], x->ne[1], x->ne[2], rows, x->nb[1] / 4, x->nb[2] / 4, x->nb[3] / 4);
++        } else {
++            relayout_rows<float><<<blocks, dim3(32, 8), 0, stream>>>(static_cast<const float*>(x->data), static_cast<float*>(dst->data),
++                                                                     x->ne[0], x->ne[1], x->ne[2], rows, x->nb[1] / 4, x->nb[2] / 4, x->nb[3] / 4);
++        }
++        return cuda_last_error() == cuda_success ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
++    }
++
+     void register_rope(ggml_backend_dev_t device) {
+         ggml_ext_kernel_desc desc = {};
+         desc.abi_version          = GGML_EXT_ABI_VERSION;
+@@ -376,6 +443,19 @@ namespace SD_CUDA_NAMESPACE {
+         desc.match     = rope_match;
+         desc.optimize  = rope_optimize;
+         GGML_ASSERT(ggml_ext_register_kernel_ex(device, &desc, GGML_EXT_KERNEL_CAPTURE_SAFE | GGML_EXT_KERNEL_REPLAY_REUSABLE));
++        desc.name      = "sd.relayout_rows.cpy." SD_CUDA_NAME ".v1";
++        desc.op        = GGML_OP_CPY;
++        desc.custom_op = nullptr;
++        desc.priority  = 90;
++        desc.supports  = relayout_supports;
++        desc.match     = nullptr;
++        desc.optimize  = nullptr;
++        desc.prepare   = relayout_prepare;
++        desc.execute   = relayout_execute;
++        GGML_ASSERT(ggml_ext_register_kernel_ex(device, &desc, GGML_EXT_KERNEL_CAPTURE_SAFE | GGML_EXT_KERNEL_REPLAY_REUSABLE));
++        desc.name = "sd.relayout_rows.cont." SD_CUDA_NAME ".v1";
++        desc.op   = GGML_OP_CONT;
++        GGML_ASSERT(ggml_ext_register_kernel_ex(device, &desc, GGML_EXT_KERNEL_CAPTURE_SAFE | GGML_EXT_KERNEL_REPLAY_REUSABLE));
+     }
+ 
+ }

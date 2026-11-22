@@ -19,6 +19,10 @@ any work.
 | # | Patch | Status |
 |---|---|---|
 | 0001 | `Tensor::index()` without a heap allocation per element, and a nearest-neighbour `interpolate` that walks per-axis offset tables instead of two coordinate vectors per element | upstream candidate |
+| 0002 | The compute workspace remembers the last two graph measurements, so the conditional and unconditional passes of a guided run both hit the cache instead of re-measuring the whole graph on every pass | upstream candidate |
+| 0003 | Wan VAE: the uncached first frame of a causal conv3d runs as a conv2d with the last temporal tap (every image decode and encode of Anima and Qwen-Image). Taken unchanged from [unslothai/stable-diffusion.cpp](https://github.com/unslothai/stable-diffusion.cpp) commit `430ee75`, MIT, author kept in the patch | third-party, upstream candidate there |
+| 0004 | CUDA INT8: `linear -> GELU -> ConvRot quantize` fused through the existing INT8 linear epilogue matcher, next to its SwiGLU form | upstream candidate |
+| 0005 | CUDA: a row-wise relayout kernel for strided F32 copies and F32 to F16 casts (the permuted head layouts around attention), one warp per contiguous source row | upstream candidate |
 
 `Tensor::index(x, y, c, n)` built a `std::vector` for every element it
 touched, and the image paths call it once per pixel per channel
@@ -37,6 +41,30 @@ LoRA, 6 steps, RTX 5090, Windows 11), same seed:
 | sampling (6 steps) | 8.26 s | 7.63 s |
 
 The output is pixel-identical to upstream (zero differing channels).
+
+### Patches 0002 to 0005 (`luma-b5`)
+
+These target the diffusion pass itself. Measured on Anima (a 2B DiT, 896x1152,
+25 steps, cfg 4, same seed), RTX 5090 and RTX 3090, Windows 11:
+
+| | `luma-b4` | `luma-b5` |
+|---|---|---|
+| RTX 5090, INT8 ConvRot weights, `--sage-attn` | 5.6 it/s | **7.2 it/s** |
+| RTX 3090, INT8 ConvRot weights, `--sage-attn` | 2.36 it/s | **2.61 it/s** |
+| RTX 5090, BF16 weights | 3.41 it/s | 3.45 it/s |
+| Wan VAE decode, 896x1152 | 0.33 s | 0.26 s |
+
+Per kernel on the RTX 5090 at 4032 tokens: the fused GELU step takes 329 us
+where the linear, the GELU pass and the quantize pass took 488 us; an F32 to
+F16 head-layout cast takes 20 us where the generic copy took 133 us, and the
+permuted F32 copy 24 us where it took 132 us.
+
+Patches 0002, 0004 and 0005 are pixel-identical to `luma-b4` on Anima (BF16
+and INT8), SDXL, Qwen-Image 2.1 and MiniMax-H3-Image. Patch 0003 changes the
+summation order of the VAE convolutions: the largest channel difference
+measured was 4 of 255 (PSNR 70 dB); `SD_VAE_FRAME_COLLAPSE=0` restores the
+full conv3d. The two CUDA fusions follow upstream's `GGML_CUDA_DISABLE_FUSION`
+switch.
 
 Former patch 0002 (auto-fit using an integrated GPU such as the RTX Spark N1X
 when there is no discrete one) was dropped at `luma-b4`: upstream's auto-fit
@@ -131,4 +159,5 @@ the "stable-diffusion.cpp (LumaByte)" runtime under Setup.
 
 ## License
 
-MIT, like upstream. Patches are (c) LumaByte, LLC.
+MIT, like upstream. Patches are (c) LumaByte, LLC, except 0003, which is
+(c) its author and taken from unslothai/stable-diffusion.cpp under MIT.

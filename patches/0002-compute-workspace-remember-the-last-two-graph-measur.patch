@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <andy@murgo.la>
+Date: Sun, 22 Nov 2026 17:31:53 -0500
+Subject: [PATCH 1/4] compute workspace: remember the last two graph
+ measurements
+
+With guidance on, the conditional and unconditional passes alternate and their text lengths differ, so a single
+remembered measurement missed on every pass: the whole graph was copied and the allocator dry-run 50 times per
+25-step image (about 3 ms per pass on a 2B DiT). Keeping the previous measurement as well makes both passes hit.
+---
+ src/core/compute_workspace.cpp | 13 +++++++++++--
+ src/core/compute_workspace.h   |  3 +++
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/compute_workspace.cpp b/src/core/compute_workspace.cpp
+index cf9d04c..60251b6 100644
+--- a/src/core/compute_workspace.cpp
++++ b/src/core/compute_workspace.cpp
+@@ -157,6 +157,11 @@ namespace sd {
+             if (key == measurement_key_) {
+                 return {measured_buffers_};
+             }
++            if (key == previous_measurement_key_) {
++                std::swap(measurement_key_, previous_measurement_key_);
++                std::swap(measured_buffers_, previous_measured_buffers_);
++                return {measured_buffers_};
++            }
+         }
+         const size_t graph_size = tensors.size() + 8;
+         auto context            = ggml_init({tensors.size() * ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false), nullptr, true});
+@@ -229,8 +234,10 @@ namespace sd {
+         }
+         ggml_free(context);
+         if (cache_measurement && !result.buffers.empty()) {
+-            measurement_key_  = std::move(key);
+-            measured_buffers_ = result.buffers;
++            previous_measurement_key_  = std::move(measurement_key_);
++            previous_measured_buffers_ = std::move(measured_buffers_);
++            measurement_key_           = std::move(key);
++            measured_buffers_          = result.buffers;
+         }
+         return result;
+     }
+@@ -268,6 +275,8 @@ namespace sd {
+         }
+         measurement_key_.clear();
+         measured_buffers_.clear();
++        previous_measurement_key_.clear();
++        previous_measured_buffers_.clear();
+         ggml_backend_sched_free(scheduler_);
+         scheduler_          = nullptr;
+         scheduler_capacity_ = 0;
+diff --git a/src/core/compute_workspace.h b/src/core/compute_workspace.h
+index 8dee5da..6227bb7 100644
+--- a/src/core/compute_workspace.h
++++ b/src/core/compute_workspace.h
+@@ -21,6 +21,9 @@ namespace sd {
+         bool active_                    = false;
+         std::vector<uint8_t> measurement_key_;
+         std::vector<BackendBufferSize> measured_buffers_;
++        // The measurement before the last: with guidance on, the conditional and unconditional passes alternate.
++        std::vector<uint8_t> previous_measurement_key_;
++        std::vector<BackendBufferSize> previous_measured_buffers_;
+ 
+         ggml_backend_sched_t make_scheduler(size_t graph_size);
+ 
