@@ -23,6 +23,8 @@ any work.
 | 0003 | Wan VAE: the uncached first frame of a causal conv3d runs as a conv2d with the last temporal tap (every image decode and encode of Anima and Qwen-Image). Taken unchanged from [unslothai/stable-diffusion.cpp](https://github.com/unslothai/stable-diffusion.cpp) commit `430ee75`, MIT, author kept in the patch | third-party, upstream candidate there |
 | 0004 | CUDA INT8: `linear -> GELU -> ConvRot quantize` fused through the existing INT8 linear epilogue matcher, next to its SwiGLU form | upstream candidate |
 | 0005 | CUDA: a row-wise relayout kernel for strided F32 copies and F32 to F16 casts (the permuted head layouts around attention), one warp per contiguous source row | upstream candidate |
+| 0006 | CUDA INT8: LayerNorm folded into the kernel that modulates, rotates and quantizes its result (`LayerNorm -> Modulate -> ConvRot`), next to the existing RMSNorm form. Not bit-identical: the reduction order differs | upstream candidate |
+| 0007 | Anima: one SiLU per pass for the timestep embedding (85 adaptive norms recomputed it) and the shift, scale and gate slices of the modulation vector used as views | upstream candidate |
 
 `Tensor::index(x, y, c, n)` built a `std::vector` for every element it
 touched, and the image paths call it once per pixel per channel
@@ -65,6 +67,25 @@ summation order of the VAE convolutions: the largest channel difference
 measured was 4 of 255 (PSNR 70 dB); `SD_VAE_FRAME_COLLAPSE=0` restores the
 full conv3d. The two CUDA fusions follow upstream's `GGML_CUDA_DISABLE_FUSION`
 switch.
+
+### Patches 0006, 0007 and CUDA Graph replay (`luma-b6`)
+
+The Windows x64 build is also compiled with `-DGGML_CUDA_GRAPHS=ON`, which
+enables the extension executor's CUDA Graph replay (off upstream;
+`GGML_CUDA_DISABLE_GRAPHS=1` turns it off at run time). Same Anima run as
+above, INT8 ConvRot weights, `--sage-attn`:
+
+| | `luma-b5` | with 0006 | with 0006, 0007 and graph replay |
+|---|---|---|---|
+| RTX 5090 | 7.2 it/s | 7.9 it/s | **8.3 it/s** |
+| RTX 3090 | 2.61 it/s | 2.73 it/s | 2.80 it/s |
+
+Patch 0007 and graph replay are pixel-identical (Anima BF16 and INT8, SDXL,
+Qwen-Image 2.1, MiniMax-H3-Image, and ten mixed-size requests on one warm
+sd-server). Graph replay keeps about 130 MiB more VRAM once every request
+shape has been seen. Patch 0006 only applies to INT8 ConvRot models with an
+adaptive LayerNorm (Anima); its output differs from the unfused path
+(PSNR 34 dB on a short run) and looks equivalent.
 
 Former patch 0002 (auto-fit using an integrated GPU such as the RTX Spark N1X
 when there is no discrete one) was dropped at `luma-b4`: upstream's auto-fit

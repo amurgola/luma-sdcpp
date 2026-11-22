@@ -29,9 +29,11 @@ if (-not $vsroot) { throw 'No VS 2022 toolset with C++ tools found (vswhere).' }
 $vcvars = Join-Path $vsroot 'VC\Auxiliary\Build\vcvars64.bat'
 $nvcc = Join-Path $CudaPath 'bin\nvcc.exe'
 
+# GGML_CUDA_GRAPHS compiles in the extension executor's CUDA Graph replay (off upstream): the kernels of a pass
+# are replayed as one graph, which removes most of the launch gaps. GGML_CUDA_DISABLE_GRAPHS=1 turns it off at run time.
 # Upstream's windows cuda12 release defines, plus: no server web frontend
 # (needs pnpm; LumaBrowser talks to the HTTP API only).
-$defines = "-DSD_CUDA=ON -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF -DSD_SERVER_BUILD_FRONTEND=OFF -DCMAKE_CUDA_ARCHITECTURES=`"$Archs`" -DCMAKE_CUDA_COMPILER=`"$nvcc`""
+$defines = "-DSD_CUDA=ON -DGGML_CUDA_GRAPHS=ON -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF -DSD_SERVER_BUILD_FRONTEND=OFF -DCMAKE_CUDA_ARCHITECTURES=`"$Archs`" -DCMAKE_CUDA_COMPILER=`"$nvcc`""
 # CMAKE_CXX_FLAGS replaces CMake's MSVC defaults rather than adding to them, so /EHsc is restated: without it the
 # examples' common.cpp (sd-server's request handling) is built with no C++ exception unwinding (warning C4530).
 cmd /c "call `"$vcvars`" >nul && cmake -S `"$work`" -B `"$work\build`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe -DCMAKE_CXX_FLAGS=`"/DWIN32 /D_WINDOWS /EHsc /bigobj`" $defines && cmake --build `"$work\build`" -- -j $Jobs"

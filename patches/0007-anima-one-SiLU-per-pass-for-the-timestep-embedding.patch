@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <andy@murgo.la>
+Date: Sun, 22 Nov 2026 18:05:25 -0500
+Subject: [PATCH] anima: one SiLU per pass for the timestep embedding,
+ modulation slices as views
+
+Every adaptive norm (three per block and the final layer) recomputed SiLU of the same timestep embedding, and
+copied its shift, scale and gate slices out of the modulation vector one by one. The activation is now computed
+once per pass and, with one sample, the slices are used as the contiguous views they are: 85 SiLU kernels and
+about 250 small copies fewer per pass. Bit-identical output.
+---
+ src/model/diffusion/anima.hpp | 36 ++++++++++++++++++-----------------
+ 1 file changed, 19 insertions(+), 17 deletions(-)
+
+diff --git a/src/model/diffusion/anima.hpp b/src/model/diffusion/anima.hpp
+index 08c20fe..aa1df1b 100644
+--- a/src/model/diffusion/anima.hpp
++++ b/src/model/diffusion/anima.hpp
+@@ -109,21 +109,21 @@ namespace Anima {
+ 
+         std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
+                                                       ggml_tensor* hidden_states,
+-                                                      ggml_tensor* embedded_timestep,
++                                                      ggml_tensor* timestep_activation,
+                                                       ggml_tensor* temb = nullptr) {
+             auto norm     = std::dynamic_pointer_cast<LayerNorm>(blocks["norm"]);
+             auto linear_1 = std::dynamic_pointer_cast<Linear>(blocks["1"]);
+             auto linear_2 = std::dynamic_pointer_cast<Linear>(blocks["2"]);
+ 
+-            auto emb = ggml_silu(ctx->ggml_ctx, embedded_timestep);
+-            emb      = linear_1->forward(ctx, emb);
++            auto emb = linear_1->forward(ctx, timestep_activation);
+             emb      = linear_2->forward(ctx, emb);  // [N, 3*C]
+ 
+             if (temb != nullptr) {
+                 emb = ggml_add(ctx->ggml_ctx, emb, temb);
+             }
+ 
+-            auto emb_chunks = ggml_ext_chunk(ctx, emb, 3, 0);
++            // With one sample the slices are contiguous views: no copies needed.
++            auto emb_chunks = ggml_ext_chunk(ctx, emb, 3, 0, emb->ne[1] != 1);
+             auto shift      = emb_chunks[0];
+             auto scale      = emb_chunks[1];
+             auto gate       = emb_chunks[2];
+@@ -149,14 +149,13 @@ namespace Anima {
+ 
+         ggml_tensor* forward(GGMLRunnerContext* ctx,
+                              ggml_tensor* hidden_states,
+-                             ggml_tensor* embedded_timestep,
++                             ggml_tensor* timestep_activation,
+                              ggml_tensor* temb = nullptr) {
+             auto norm     = std::dynamic_pointer_cast<LayerNorm>(blocks["norm"]);
+             auto linear_1 = std::dynamic_pointer_cast<Linear>(blocks["1"]);
+             auto linear_2 = std::dynamic_pointer_cast<Linear>(blocks["2"]);
+ 
+-            auto emb = ggml_silu(ctx->ggml_ctx, embedded_timestep);
+-            emb      = linear_1->forward(ctx, emb);
++            auto emb = linear_1->forward(ctx, timestep_activation);
+             emb      = linear_2->forward(ctx, emb);  // [N, 2*C]
+ 
+             if (temb != nullptr) {
+@@ -164,7 +163,8 @@ namespace Anima {
+                 emb          = ggml_add(ctx->ggml_ctx, emb, temb_2c);
+             }
+ 
+-            auto emb_chunks = ggml_ext_chunk(ctx, emb, 2, 0);
++            // With one sample the slices are contiguous views: no copies needed.
++            auto emb_chunks = ggml_ext_chunk(ctx, emb, 2, 0, emb->ne[1] != 1);
+             auto shift      = emb_chunks[0];
+             auto scale      = emb_chunks[1];
+ 
+@@ -406,7 +406,7 @@ namespace Anima {
+         ggml_tensor* forward(GGMLRunnerContext* ctx,
+                              ggml_tensor* hidden_states,
+                              ggml_tensor* encoder_hidden_states,
+-                             ggml_tensor* embedded_timestep,
++                             ggml_tensor* timestep_activation,
+                              ggml_tensor* temb,
+                              ggml_tensor* image_pe) {
+             auto norm1 = std::dynamic_pointer_cast<AdaLayerNormZero>(blocks["adaln_modulation_self_attn"]);
+@@ -416,15 +416,15 @@ namespace Anima {
+             auto norm3 = std::dynamic_pointer_cast<AdaLayerNormZero>(blocks["adaln_modulation_mlp"]);
+             auto mlp   = std::dynamic_pointer_cast<AnimaMLP>(blocks["mlp"]);
+ 
+-            auto [normed1, gate1] = norm1->forward(ctx, hidden_states, embedded_timestep, temb);
++            auto [normed1, gate1] = norm1->forward(ctx, hidden_states, timestep_activation, temb);
+             auto h                = attn1->forward(ctx, normed1, nullptr, image_pe, image_pe);
+             hidden_states         = ggml_add(ctx->ggml_ctx, hidden_states, apply_gate(ctx->ggml_ctx, h, gate1));
+ 
+-            auto [normed2, gate2] = norm2->forward(ctx, hidden_states, embedded_timestep, temb);
++            auto [normed2, gate2] = norm2->forward(ctx, hidden_states, timestep_activation, temb);
+             h                     = attn2->forward(ctx, normed2, encoder_hidden_states, nullptr, nullptr);
+             hidden_states         = ggml_add(ctx->ggml_ctx, hidden_states, apply_gate(ctx->ggml_ctx, h, gate2));
+ 
+-            auto [normed3, gate3] = norm3->forward(ctx, hidden_states, embedded_timestep, temb);
++            auto [normed3, gate3] = norm3->forward(ctx, hidden_states, timestep_activation, temb);
+             h                     = mlp->forward(ctx, normed3);
+             hidden_states         = ggml_add(ctx->ggml_ctx, hidden_states, apply_gate(ctx->ggml_ctx, h, gate3));
+ 
+@@ -447,12 +447,12 @@ namespace Anima {
+ 
+         ggml_tensor* forward(GGMLRunnerContext* ctx,
+                              ggml_tensor* hidden_states,
+-                             ggml_tensor* embedded_timestep,
++                             ggml_tensor* timestep_activation,
+                              ggml_tensor* temb) {
+             auto adaln  = std::dynamic_pointer_cast<AdaLayerNorm>(blocks["adaln_modulation"]);
+             auto linear = std::dynamic_pointer_cast<Linear>(blocks["linear"]);
+ 
+-            hidden_states = adaln->forward(ctx, hidden_states, embedded_timestep, temb);
++            hidden_states = adaln->forward(ctx, hidden_states, timestep_activation, temb);
+             hidden_states = linear->forward(ctx, hidden_states);
+             return hidden_states;
+         }
+@@ -518,6 +518,8 @@ namespace Anima {
+             auto timestep_proj     = ggml_ext_timestep_embedding(ctx, timestep, static_cast<int>(config.hidden_size));
+             auto temb              = t_embedder->forward(ctx, timestep_proj);
+             auto embedded_timestep = t_embedding_norm->forward(ctx, timestep_proj);
++            // Every block's adaptive norms start from the same activated embedding: one SiLU per pass.
++            auto timestep_activation = ggml_silu(ctx->ggml_ctx, embedded_timestep);
+ 
+             if (t5_ids != nullptr) {
+                 auto adapted_context = llm_adapter->forward(ctx, encoder_hidden_states, t5_ids, adapter_q_pe, adapter_k_pe);
+@@ -543,18 +545,18 @@ namespace Anima {
+             }
+ 
+             sd::ggml_graph_cut::mark_graph_cut(x, "anima.prelude", "x");
+-            sd::ggml_graph_cut::mark_graph_cut(embedded_timestep, "anima.prelude", "embedded_timestep");
++            sd::ggml_graph_cut::mark_graph_cut(timestep_activation, "anima.prelude", "embedded_timestep");
+             sd::ggml_graph_cut::mark_graph_cut(temb, "anima.prelude", "temb");
+             sd::ggml_graph_cut::mark_graph_cut(encoder_hidden_states, "anima.prelude", "context");
+ 
+             for (int i = 0; i < config.num_layers; i++) {
+                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["blocks." + std::to_string(i)]);
+-                x          = block->forward(ctx, x, encoder_hidden_states, embedded_timestep, temb, image_pe);
++                x          = block->forward(ctx, x, encoder_hidden_states, timestep_activation, temb, image_pe);
+                 sd::ggml_graph_cut::mark_graph_cut(x, "anima.blocks." + std::to_string(i), "x");
+             }
+             x = ggml_ext_slice(ctx, x, 1, 0, img_len);
+ 
+-            x = final_layer->forward(ctx, x, embedded_timestep, temb);  // [N, h*w, ph*pw*C]
++            x = final_layer->forward(ctx, x, timestep_activation, temb);  // [N, h*w, ph*pw*C]
+ 
+             x = DiT::unpatchify_and_crop(ctx, x, H, W, config.patch_size, config.patch_size, false);  // [N, C, H, W]
+ 

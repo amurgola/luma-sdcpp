@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <andy@murgo.la>
+Date: Sun, 22 Nov 2026 17:52:45 -0500
+Subject: [PATCH] cuda int8: fuse LayerNorm into modulate and convrot quantize
+
+Adds the LayerNorm -> Modulate -> ConvRot H256 form (adaptive LayerNorm ahead of an INT8 linear) to the ConvRot
+fusion, next to the existing RMSNorm form. The row's mean and deviation are reduced first and the normalisation is
+applied while loading into the in-register rotation, so the separate F32 LayerNorm pass is gone: 85 us -> 42 us
+per use on an RTX 5090 at 4032 x 2048, three uses per block. Not bit-identical to the unfused path (the
+reduction order differs and INT8 rounding amplifies it); PSNR 34 dB on a short Anima run, visually equivalent.
+---
+ src/core/cuda/convrot.cu       | 22 +++++++++++++++++++---
+ src/core/cuda/convrot_kernel.h | 25 +++++++++++++++++++++++++
+ 2 files changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/cuda/convrot.cu b/src/core/cuda/convrot.cu
+index 26920ae..b46161b 100644
+--- a/src/core/cuda/convrot.cu
++++ b/src/core/cuda/convrot.cu
+@@ -31,7 +31,8 @@ namespace SD_CUDA_NAMESPACE {
+                     RMS_MOD,
+                     SWIGLU,
+                     SILU,
+-                    SIGMOID };
++                    SIGMOID,
++                    NORM_MOD };
+         struct Operation {
+             Kind kind;
+             const ggml_tensor* input      = nullptr;
+@@ -60,6 +61,13 @@ namespace SD_CUDA_NAMESPACE {
+                 op.kind  = SCALE;
+                 op.scale = param_f32(first, 0);
+                 op.bias  = param_f32(first, 1);
++            } else if (count == 3 && first->op == GGML_OP_NORM && sd_ggml_modulate_describe(nodes[1]) && nodes[1]->src[0] == first && value == nodes[1]) {
++                op.kind       = NORM_MOD;
++                op.modulation = nodes[1]->src[1];
++                op.shift      = nodes[1]->src[2];
++                op.eps        = param_f32(first, 0);
++                if (op.k < 1024 || !vector(op.modulation, op.k) || (op.shift && !vector(op.shift, op.k)))
++                    return false;
+             } else if (count == 3 && first->op == GGML_OP_NORM && nodes[1]->op == GGML_OP_MUL && nodes[1]->src[0] == first && value == nodes[1]) {
+                 op.kind       = NORM;
+                 op.modulation = nodes[1]->src[1];
+@@ -114,7 +122,7 @@ namespace SD_CUDA_NAMESPACE {
+             return true;
+         }
+         static bool supported(const Operation& op, const ggml_ext_gpu_device_info& device) {
+-            const size_t extra = op.kind == NORM ? 384 : op.kind == RMS_MOD ? 256
++            const size_t extra = op.kind == NORM || op.kind == NORM_MOD ? 384 : op.kind == RMS_MOD ? 256
+                                                                             : 128;
+             return device.device >= 0 && size_t(op.k) * sizeof(float) + extra <= device.shared_memory;
+         }
+@@ -153,6 +161,11 @@ namespace SD_CUDA_NAMESPACE {
+                         chain[2] = value;
+                         chain[3] = quant;
+                         count    = 4;
++                    } else if (weight->op == GGML_OP_NORM) {
++                        chain[0] = weight;
++                        chain[1] = value;
++                        chain[2] = quant;
++                        count    = 3;
+                     } else {
+                         chain[0] = value;
+                         chain[1] = quant;
+@@ -229,7 +242,7 @@ namespace SD_CUDA_NAMESPACE {
+                     return status;
+                 p.configured = true;
+             }
+-            const int threads    = Normalize ? 1024 : RMS                               ? (op.k <= 1024 ? 128 : op.k <= 6144 ? 256
++            const int threads    = Normalize && !Modulate ? 1024 : RMS                               ? (op.k <= 1024 ? 128 : op.k <= 6144 ? 256
+                                                                                                             : op.k <= 8192   ? 512
+                                                                                                                              : 1024)
+                                                   : Swiglu && !Sigmoid && op.k >= 16384 ? 512
+@@ -267,6 +280,9 @@ namespace SD_CUDA_NAMESPACE {
+                 case RMS_MOD:
+                     error = launch<false, false, false, false, true>(plan, op, output, stream);
+                     break;
++                case NORM_MOD:
++                    error = launch<false, true, false, false, false, true>(plan, op, output, stream);
++                    break;
+                 case MOD:
+                     error = launch<false, false, false, false, false, true>(plan, op, output, stream);
+                     break;
+diff --git a/src/core/cuda/convrot_kernel.h b/src/core/cuda/convrot_kernel.h
+index 04abf97..90f0b9f 100644
+--- a/src/core/cuda/convrot_kernel.h
++++ b/src/core/cuda/convrot_kernel.h
+@@ -92,6 +92,28 @@ namespace SD_CUDA_NAMESPACE {
+                 rms_scale       = rsqrtf(sum / k + eps);
+             }
+ 
++            // LayerNorm applied while loading: the row's mean and deviation, for the fused
++            // LayerNorm -> Modulate -> ConvRot path.
++            [[maybe_unused]] float ln_mean = 0.0f, ln_inv_std = 1.0f;
++            if constexpr (normalize && warp_rotation) {
++                __shared__ float2 ln_sums[32];
++                float2 partial = make_float2(0.0f, 0.0f);
++                for (int64_t i = tid; i < k; i += blockDim.x) {
++                    const float value = src_row[i];
++                    partial.x += value;
++                    partial.y += value * value;
++                }
++                partial = warp_reduce_sum(partial);
++                if (tid % 32 == 0) {
++                    ln_sums[tid / 32] = partial;
++                }
++                __syncthreads();
++                const int warps    = blockDim.x / 32;
++                const float2 total = warp_reduce_sum(tid % 32 < warps ? ln_sums[tid % 32] : make_float2(0.0f, 0.0f));
++                ln_mean            = total.x / k;
++                ln_inv_std         = rsqrtf(total.y / k - ln_mean * ln_mean + eps);
++            }
++
+             if constexpr (swiglu || warp_rotation) {
+                 const int lane = tid % 32;
+                 for (int64_t group = tid / 32; group < k / group_size; group += blockDim.x / 32) {
+@@ -101,6 +123,9 @@ namespace SD_CUDA_NAMESPACE {
+                         const int64_t i = group * group_size + j * 32 + lane;
+                         if constexpr (!swiglu) {
+                             float value = src_row[i];
++                            if constexpr (normalize) {
++                                value = __fmul_rn(__fsub_rn(value, ln_mean), ln_inv_std);
++                            }
+                             if constexpr (rms_modulation) {
+                                 value = __fmul_rn(__fmul_rn(value, rms_scale), rms_weight[i]);
+                             }
