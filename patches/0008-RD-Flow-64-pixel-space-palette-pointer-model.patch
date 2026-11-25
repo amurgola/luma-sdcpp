@@ -15,8 +15,9 @@ instead of masked, and weights stay F32 (the reference warns its activations ove
 
 Checked against the reference PyTorch pipeline (fp32, --rng cpu, same caption and seed): a locked palette gives a
 pixel-identical image (CLI and sd-server), the model-chosen palette 91% identical pixels with the same mask.
+The released text_encoder/model.safetensors loads as is (its names lack the "model." prefix; mapped for this version).
 ---
- docs/rd_flow_64.md                 |  40 +++
+ docs/rd_flow_64.md                 |  31 ++
  examples/common/common.cpp         |  13 +
  examples/common/common.h           |   2 +
  include/stable-diffusion.h         |   2 +
@@ -28,17 +29,18 @@ pixel-identical image (CLI and sd-server), the model-chosen palette 91% identica
  src/model/vae/vae.hpp              |   3 +-
  src/model_loader.cpp               |   5 +
  src/model_registry.cpp             |   2 +
+ src/name_conversion.cpp            |  11 +
  src/pipeline/image.cpp             |   5 +
  src/pipeline/rd_flow.cpp           | 651 +++++++++++++++++++++++++++++++++++++
  src/pipeline/rd_flow.h             |  25 ++
- 15 files changed, 1423 insertions(+), 2 deletions(-)
+ 16 files changed, 1425 insertions(+), 2 deletions(-)
 
 diff --git a/docs/rd_flow_64.md b/docs/rd_flow_64.md
 new file mode 100644
-index 0000000..c6791ee
+index 0000000..db9401a
 --- /dev/null
 +++ b/docs/rd_flow_64.md
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,31 @@
 +# How to Use
 +
 +RD Flow 64 by Retro Diffusion is a 271M-parameter pixel-space flow transformer that draws 64x64 pixel art. Every
@@ -50,18 +52,9 @@ index 0000000..c6791ee
 +## Download weights
 +
 +- Drawing model: [Retro-Diffusion/rd-flow-64](https://huggingface.co/Retro-Diffusion/rd-flow-64) `rd-flow-64.safetensors`
-+- Prompt reader: the same repository's `text_encoder/model.safetensors` (the first 27 layers of Qwen3-VL-4B-Instruct).
-+  Its tensors are named without the `model.` prefix, so rename them once, for example:
-+
-+```python
-+from safetensors import safe_open
-+from safetensors.torch import save_file
-+with safe_open("text_encoder/model.safetensors", "pt") as f:
-+    save_file({"model." + k: f.get_tensor(k) for k in f.keys()}, "rd-flow-64-text-encoder.safetensors")
-+```
-+
-+  Then optionally quantize it (Q8_0 is 3.3 GB and draws the same images):
-+  `sd-cli -M convert -m rd-flow-64-text-encoder.safetensors --type q8_0 -o rd-flow-64-text-encoder-Q8_0.gguf`
++- Prompt reader: the same repository's `text_encoder/model.safetensors` (the first 27 layers of Qwen3-VL-4B-Instruct),
++  used as is. Optionally quantize it (Q8_0 is 3.3 GB and draws the same images):
++  `sd-cli -M convert -m text_encoder/model.safetensors --type q8_0 -o rd-flow-64-text-encoder-Q8_0.gguf`
 +
 +## Examples
 +
@@ -936,6 +929,28 @@ index 9a80bb8..150c7f3 100644
          for (const auto* definition : result) {
              if (!definition)
                  throw std::logic_error("missing model registration");
+diff --git a/src/name_conversion.cpp b/src/name_conversion.cpp
+index 79179f6..2a41459 100644
+--- a/src/name_conversion.cpp
++++ b/src/name_conversion.cpp
+@@ -1780,6 +1780,17 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
+ 
+     replace_with_prefix_map(name, prefix_map);
+ 
++    if (version == VERSION_RD_FLOW_64) {
++        // The released prompt reader keeps Qwen's text-model names without the "model." prefix.
++        for (const char* part : {"layers.", "embed_tokens.", "norm."}) {
++            const std::string bare = std::string("text_encoders.llm.") + part;
++            if (starts_with(name, bare)) {
++                name = "text_encoders.llm.model." + name.substr(std::string("text_encoders.llm.").size());
++                break;
++            }
++        }
++    }
++
+     if (version == VERSION_MOSS_IMAGE) {
+         const std::string te_prefix = "text_encoders.llm.";
+         if (starts_with(name, te_prefix + "blk.")) {
 diff --git a/src/pipeline/image.cpp b/src/pipeline/image.cpp
 index 5e7a349..a886302 100644
 --- a/src/pipeline/image.cpp

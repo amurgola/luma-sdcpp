@@ -93,8 +93,8 @@ adaptive LayerNorm (Anima); its output differs from the unfused path
 [RD Flow 64](https://huggingface.co/Retro-Diffusion/rd-flow-64) draws 64x64
 pixel art directly on the pixel grid: every pixel is an exact palette colour
 or fully transparent. It has no VAE and its own sampler, so `generate_image`
-branches to `src/pipeline/rd_flow.cpp`. Usage, the text encoder rename and the
-Q8_0 conversion are in `docs/rd_flow_64.md` of the patched tree. The weights
+branches to `src/pipeline/rd_flow.cpp`. Usage and the optional
+Q8_0 conversion of the text encoder (the released file loads as is) are in `docs/rd_flow_64.md` of the patched tree. The weights
 are non-commercial.
 
 Checked against the reference PyTorch pipeline (fp32 drawing model, same
