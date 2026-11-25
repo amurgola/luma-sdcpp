@@ -25,6 +25,7 @@ any work.
 | 0005 | CUDA: a row-wise relayout kernel for strided F32 copies and F32 to F16 casts (the permuted head layouts around attention), one warp per contiguous source row | upstream candidate |
 | 0006 | CUDA INT8: LayerNorm folded into the kernel that modulates, rotates and quantizes its result (`LayerNorm -> Modulate -> ConvRot`), next to the existing RMSNorm form. Not bit-identical: the reduction order differs | upstream candidate |
 | 0007 | Anima: one SiLU per pass for the timestep embedding (85 adaptive norms recomputed it) and the shift, scale and gate slices of the modulation vector used as views | upstream candidate |
+| 0008 | RD Flow 64 (Retro Diffusion, 64x64 pixel art): the pixel-space palette-pointer network, its own sampler with palette extraction and pointer commit, RGBA output without a VAE, and the `palette` / `opaque_background` request fields | new model, upstream candidate |
 
 `Tensor::index(x, y, c, n)` built a `std::vector` for every element it
 touched, and the image paths call it once per pixel per channel
@@ -86,6 +87,27 @@ sd-server). Graph replay keeps about 130 MiB more VRAM once every request
 shape has been seen. Patch 0006 only applies to INT8 ConvRot models with an
 adaptive LayerNorm (Anima); its output differs from the unfused path
 (PSNR 34 dB on a short run) and looks equivalent.
+
+### Patch 0008: RD Flow 64
+
+[RD Flow 64](https://huggingface.co/Retro-Diffusion/rd-flow-64) draws 64x64
+pixel art directly on the pixel grid: every pixel is an exact palette colour
+or fully transparent. It has no VAE and its own sampler, so `generate_image`
+branches to `src/pipeline/rd_flow.cpp`. Usage, the text encoder rename and the
+Q8_0 conversion are in `docs/rd_flow_64.md` of the patched tree. The weights
+are non-commercial.
+
+Checked against the reference PyTorch pipeline (fp32 drawing model, same
+caption, seed and `--rng cpu`) on an RTX 3090:
+
+| | result |
+|---|---|
+| locked palette (Sweetie 16), sd-cli and sd-server | pixel-identical |
+| locked palette, Q8_0 text encoder on GPU / on CPU | 99.9% / 100% identical pixels |
+| palette chosen by the model | 91% identical pixels, same mask, 30 of 32 colours |
+| prompt read, Q8_0 on the CPU | 1.6 s (PyTorch on the CPU: 19 s) |
+| 16 steps with guidance, one image | 1.5 s |
+| VRAM, text encoder on the CPU | about 1 GB |
 
 Former patch 0002 (auto-fit using an integrated GPU such as the RTX Spark N1X
 when there is no discrete one) was dropped at `luma-b4`: upstream's auto-fit

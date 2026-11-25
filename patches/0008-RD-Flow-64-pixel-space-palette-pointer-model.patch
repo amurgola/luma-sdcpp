@@ -1,0 +1,1652 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Murgola <andy@murgo.la>
+Date: Wed, 25 Nov 2026 16:46:52 -0500
+Subject: [PATCH] RD Flow 64: pixel-space palette-pointer model
+
+Retro Diffusion's RD Flow 64 (271M, released 2026-11-24): an hourglass flow transformer over a 64x64 OKLab + alpha
+grid (8x8 window attention at 64 and 32, a 16x16 core attending jointly over registers, caption, palette and image),
+conditioned on the first 27 layers of Qwen3-VL-4B, with a palette-pointer head. It has no VAE and its own sampler
+(16 Euler x-prediction steps, guidance over t <= 0.9, palette extraction at t = 0.6, pointer from 0.35, commit of
+confident pixels from 0.55), so generate_image branches to pipeline/rd_flow.cpp, which returns 64x64 RGBA directly.
+
+New request fields palette (--palette, "palette") and opaque_background (--opaque-background,
+"opaque_background"). Network calls run one image each; dropped text and unused palette slots are left out
+instead of masked, and weights stay F32 (the reference warns its activations overflow F16).
+
+Checked against the reference PyTorch pipeline (fp32, --rng cpu, same caption and seed): a locked palette gives a
+pixel-identical image (CLI and sd-server), the model-chosen palette 91% identical pixels with the same mask.
+---
+ docs/rd_flow_64.md                 |  40 +++
+ examples/common/common.cpp         |  13 +
+ examples/common/common.h           |   2 +
+ include/stable-diffusion.h         |   2 +
+ src/conditioning/conditioner.hpp   |   9 +-
+ src/generation_info.cpp            |   7 +
+ src/model.h                        |   1 +
+ src/model/diffusion/rd_flow.hpp    | 629 +++++++++++++++++++++++++++++++++++
+ src/model/integrations/rd_flow.cpp |  31 ++
+ src/model/vae/vae.hpp              |   3 +-
+ src/model_loader.cpp               |   5 +
+ src/model_registry.cpp             |   2 +
+ src/pipeline/image.cpp             |   5 +
+ src/pipeline/rd_flow.cpp           | 651 +++++++++++++++++++++++++++++++++++++
+ src/pipeline/rd_flow.h             |  25 ++
+ 15 files changed, 1423 insertions(+), 2 deletions(-)
+
+diff --git a/docs/rd_flow_64.md b/docs/rd_flow_64.md
+new file mode 100644
+index 0000000..c6791ee
+--- /dev/null
++++ b/docs/rd_flow_64.md
+@@ -0,0 +1,40 @@
++# How to Use
++
++RD Flow 64 by Retro Diffusion is a 271M-parameter pixel-space flow transformer that draws 64x64 pixel art. Every
++pixel is an exact palette colour or fully transparent: a palette-pointer head picks one entry of a palette that the
++model extracts while it draws, or of a palette you lock. Output is a 64x64 RGBA PNG; there is no VAE.
++
++The weights are licensed for non-commercial use only (RD Flow 64 Model License); images you make are yours.
++
++## Download weights
++
++- Drawing model: [Retro-Diffusion/rd-flow-64](https://huggingface.co/Retro-Diffusion/rd-flow-64) `rd-flow-64.safetensors`
++- Prompt reader: the same repository's `text_encoder/model.safetensors` (the first 27 layers of Qwen3-VL-4B-Instruct).
++  Its tensors are named without the `model.` prefix, so rename them once, for example:
++
++```python
++from safetensors import safe_open
++from safetensors.torch import save_file
++with safe_open("text_encoder/model.safetensors", "pt") as f:
++    save_file({"model." + k: f.get_tensor(k) for k in f.keys()}, "rd-flow-64-text-encoder.safetensors")
++```
++
++  Then optionally quantize it (Q8_0 is 3.3 GB and draws the same images):
++  `sd-cli -M convert -m rd-flow-64-text-encoder.safetensors --type q8_0 -o rd-flow-64-text-encoder-Q8_0.gguf`
++
++## Examples
++
++```
++sd-cli --diffusion-model rd-flow-64.safetensors --llm rd-flow-64-text-encoder-Q8_0.gguf --backend te=cpu \
++  -p "<a 120-200 word caption>" -W 64 -H 64 --steps 16 --cfg-scale 4 --rng cpu
++```
++
++- `--palette "#1a1c2c,#5d275d,..."` locks every pixel to those colours (sd-server: `"palette"`).
++- `--opaque-background` draws a full-frame picture instead of a transparent sprite (sd-server: `"opaque_background": true`).
++- The model was trained on long, plain captions (120-200 words: the subject part by part, pose, view, framing,
++  background, outline and shading); short prompts work much worse. The prompting guide in
++  [Retro-Diffusion/rd-flow-64](https://github.com/Retro-Diffusion/rd-flow-64) has a system prompt for an LLM to
++  write them.
++- `--rng cpu` reproduces the reference PyTorch pipeline's noise for a seed. Guidance 3-4 works best.
++- The prompt reader is read once per prompt; on the CPU it takes about 1.5 s, so `--backend te=cpu` keeps VRAM use
++  near 1 GB.
+diff --git a/examples/common/common.cpp b/examples/common/common.cpp
+index 102bf95..f9e815f 100644
+--- a/examples/common/common.cpp
++++ b/examples/common/common.cpp
+@@ -1188,6 +1188,11 @@ ArgOptions SDGenerationParams::get_options() {
+          "under --hires-upscalers-dir (default: Latent)",
+          0,
+          &hires_upscaler},
++        {"",
++         "--palette",
++         "colours every pixel must use, comma separated #rrggbb (palette-pointer models such as RD Flow 64)",
++         0,
++         &palette},
+         {"",
+          "--control-type",
+          "kind of the control image, one of [openpose, depth, scribble, canny, normal, segment, tile, repaint]. "
+@@ -1397,6 +1402,10 @@ ArgOptions SDGenerationParams::get_options() {
+          "--circular",
+          "enable circular padding on both axes for tileable output",
+          true, &circular},
++        {"",
++         "--opaque-background",
++         "draw a full-frame picture instead of a transparent sprite (palette-pointer models such as RD Flow 64)",
++         true, &opaque_background},
+         {"",
+          "--circularx",
+          "enable circular padding on x-axis (width) only",
+@@ -2252,6 +2261,8 @@ bool SDGenerationParams::from_json_str(
+     load_if_exists("cache_option", cache_option);
+     load_if_exists("scm_mask", scm_mask);
+     load_if_exists("ref_image_args", ref_image_args);
++    load_if_exists("palette", palette);
++    load_if_exists("opaque_background", opaque_background);
+ 
+     load_if_exists("clip_skip", clip_skip);
+     load_if_exists("width", width);
+@@ -2893,6 +2904,8 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
+     params.ref_images          = ref_image_views.empty() ? nullptr : ref_image_views.data();
+     params.ref_images_count    = static_cast<int>(ref_image_views.size());
+     params.ref_image_args      = ref_image_args.c_str();
++    params.palette             = palette.empty() ? nullptr : palette.c_str();
++    params.opaque_background   = opaque_background;
+     params.mask_image          = mask_image.get();
+     params.width               = get_resolved_width();
+     params.height              = get_resolved_height();
+diff --git a/examples/common/common.h b/examples/common/common.h
+index d4df4fa..1e85519 100644
+--- a/examples/common/common.h
++++ b/examples/common/common.h
+@@ -259,6 +259,8 @@ struct SDGenerationParams {
+     std::string extra_tiling_args;
+ 
+     std::string ref_image_args;
++    std::string palette;
++    bool opaque_background = false;
+     std::string image_preprocess;
+ 
+     std::string pm_id_images_dir;
+diff --git a/include/stable-diffusion.h b/include/stable-diffusion.h
+index 7453a3f..2aa13ae 100644
+--- a/include/stable-diffusion.h
++++ b/include/stable-diffusion.h
+@@ -458,6 +458,8 @@ typedef struct {
+     bool circular_y;
+     sd_image_preprocess_params_t image_preprocess;
+     enum sd_control_type_t control_type;
++    const char* palette;     // "#rrggbb,..." colours every pixel must use (palette-pointer models)
++    bool opaque_background;  // full-frame picture instead of a transparent sprite (palette-pointer models)
+ } sd_img_gen_params_t;
+ 
+ typedef struct {
+diff --git a/src/conditioning/conditioner.hpp b/src/conditioning/conditioner.hpp
+index 12f4dc9..28c145c 100644
+--- a/src/conditioning/conditioner.hpp
++++ b/src/conditioning/conditioner.hpp
+@@ -2017,7 +2017,8 @@ struct LLMEmbedder : public Conditioner {
+                    sd_version_is_krea2(version) ||
+                    sd_version_is_minimax_h3(version) ||
+                    sd_version_is_mage_flow(version) ||
+-                   version == VERSION_IRIS) {
++                   version == VERSION_IRIS ||
++                   version == VERSION_RD_FLOW_64) {
+             arch = LLM::LLMArch::QWEN3_VL;
+         } else if (sd_version_is_z_image(version) || sd_version_is_z_image_l2p(version) || version == VERSION_OVIS_IMAGE || version == VERSION_FLUX2_KLEIN) {
+             arch = LLM::LLMArch::QWEN3;
+@@ -3081,6 +3082,12 @@ struct LLMEmbedder : public Conditioner {
+             prompt += conditioner_params.text;
+             prompt += "<|im_end|>\n<|im_start|>assistant\n";
+             prompt_attn_range = {0, 0};
++        } else if (version == VERSION_RD_FLOW_64) {
++            // Raw caption tokens, no template; the reader is cut at 27 layers, so the final tap is its normed output.
++            prompt_template_encode_start_idx = 0;
++            max_length                       = 512;
++            prompt_attn_range                = {0, 0};
++            prompt += conditioner_params.text;
+         } else if (sd_version_is_ernie_image(version)) {
+             prompt_template_encode_start_idx = 0;
+             out_layers                       = {25};  // -2
+diff --git a/src/generation_info.cpp b/src/generation_info.cpp
+index 0d48291..8c3e2b7 100644
+--- a/src/generation_info.cpp
++++ b/src/generation_info.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <cmath>
+ #include <cstdio>
++#include <type_traits>
+ #include <cstdlib>
+ #include <cstring>
+ 
+@@ -119,6 +120,12 @@ namespace sd {
+             info["circular_y"] = true;
+         if (p.ref_image_args && *p.ref_image_args)
+             info["ref_image_args"] = p.ref_image_args;
++        if constexpr (std::is_same_v<Params, sd_img_gen_params_t>) {
++            if (p.palette && *p.palette)
++                info["palette"] = p.palette;
++            if (p.opaque_background)
++                info["opaque_background"] = true;
++        }
+         if (p.image_preprocess.rules && *p.image_preprocess.rules)
+             info["image_preprocess"] = {{"rules", p.image_preprocess.rules}};
+         const auto& t = p.vae_tiling_params;
+diff --git a/src/model.h b/src/model.h
+index 2184f39..cdf48a7 100644
+--- a/src/model.h
++++ b/src/model.h
+@@ -72,6 +72,7 @@ enum SDVersion {
+     VERSION_CHROMA,
+     VERSION_P_H3_IMAGE,
+     VERSION_MINIMAX_H3_IMAGE,
++    VERSION_RD_FLOW_64,
+     VERSION_COUNT,
+ };
+ 
+diff --git a/src/model/diffusion/rd_flow.hpp b/src/model/diffusion/rd_flow.hpp
+new file mode 100644
+index 0000000..791d591
+--- /dev/null
++++ b/src/model/diffusion/rd_flow.hpp
+@@ -0,0 +1,629 @@
++#ifndef __SD_MODEL_DIFFUSION_RD_FLOW_HPP__
++#define __SD_MODEL_DIFFUSION_RD_FLOW_HPP__
++
++#include <cmath>
++#include <string>
++#include <vector>
++
++#include "core/ggml_extend.h"
++#include "core/ggml_runner.h"
++#include "core/util.h"
++#include "model/common/ggml_block.hpp"
++#include "model/diffusion/model.hpp"
++#include "model_loader.h"
++
++// Ref: https://github.com/Retro-Diffusion/rd-flow-64 (rdflow/model.py, rdflow/layers.py)
++//
++// RD Flow 64 is a pixel-space hourglass flow transformer over a 64x64 OKLab + alpha grid with a
++// palette-pointer head. One call runs one image (no batch); conditional and unconditional passes
++// are separate calls, and masked tokens (dropped text, unused palette slots) are left out instead
++// of masked, which is equivalent and needs no attention masks.
++
++namespace RDFlow {
++    constexpr int GRAPH_SIZE        = 40960;
++    constexpr int SIZE              = 64;
++    constexpr int CHANNELS          = 4;
++    constexpr int64_t D0            = 128;
++    constexpr int64_t D1            = 256;
++    constexpr int64_t DC            = 1024;
++    constexpr int HEAD_DIM          = 64;
++    constexpr int WINDOW            = 8;
++    constexpr int64_t TEXT_DIM      = 2560;
++    constexpr int N_REGISTERS       = 4;
++    constexpr int64_t DK            = 128;
++    constexpr int64_t COLOUR_HIDDEN = 256;
++    constexpr int COLOUR_FREQS      = 8;
++    constexpr int64_t COLOUR_FEATS  = 3 + 6 * COLOUR_FREQS;
++    constexpr int N_RAMPS           = 16;
++    constexpr int LEVEL_DEPTH       = 2;
++    constexpr int CORE_DEPTH        = 16;
++    constexpr int TEXT_ADAPTER      = 2;
++    constexpr float MLP_RATIO       = 3.f;
++    constexpr float ROPE_THETA      = 100.f;
++    constexpr int TIME_DIM          = 256;
++    constexpr int SOURCE            = 6;
++    constexpr int N_ATTRS           = 4;
++
++    // RMSNorm whose weight is named "w" (rdflow's own layer).
++    class RMSNormW : public UnaryBlock {
++        int64_t dim;
++
++        void init_params(ggml_context* ctx, const String2TensorStorage& = {}, const std::string = "") override {
++            params["w"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, dim);
++        }
++
++    public:
++        explicit RMSNormW(int64_t dim)
++            : dim(dim) {}
++
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
++            return ggml_mul(ctx->ggml_ctx, ggml_rms_norm(ctx->ggml_ctx, x, 1e-6f), params["w"]);
++        }
++    };
++
++    // Depthwise 3x3 conv kept in F32: the network's activations overflow F16.
++    class DepthwiseConv3 : public UnaryBlock {
++        int64_t channels;
++
++        void init_params(ggml_context* ctx, const String2TensorStorage& = {}, const std::string = "") override {
++            params["weight"] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 3, 1, channels);
++            params["bias"]   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, channels);
++        }
++
++    public:
++        explicit DepthwiseConv3(int64_t channels)
++            : channels(channels) {}
++
++        // x: [W, H, C, 1]
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
++            auto out = ggml_conv_2d_dw_direct(ctx->ggml_ctx, params["weight"], x, 1, 1, 1, 1, 1, 1);
++            return ggml_add(ctx->ggml_ctx, out, ggml_reshape_4d(ctx->ggml_ctx, params["bias"], 1, 1, channels, 1));
++        }
++    };
++
++    static inline std::shared_ptr<Linear> linear(int64_t in, int64_t out, bool bias = true) {
++        return std::make_shared<Linear>(in, out, bias, true);
++    }
++
++    static inline ggml_tensor* row(GGMLRunnerContext* ctx, ggml_tensor* table, int64_t index) {
++        return ggml_view_1d(ctx->ggml_ctx, table, table->ne[0], index * table->nb[1]);
++    }
++
++    // torch.roll along one dim: out[i] = in[(i - shift) mod n].
++    static inline ggml_tensor* roll(GGMLRunnerContext* ctx, ggml_tensor* x, int dim, int64_t shift) {
++        const int64_t n = x->ne[dim];
++        shift           = ((shift % n) + n) % n;
++        if (shift == 0) {
++            return x;
++        }
++        auto tail = ggml_ext_slice(ctx, x, dim, n - shift, n);
++        auto head = ggml_ext_slice(ctx, x, dim, 0, n - shift);
++        return ggml_concat(ctx->ggml_ctx, tail, head, dim);
++    }
++
++    // x: [hd, heads, N, B]; cos/sin: [hd/2, 1, N, B'] with B a multiple of B'. Rotates (first half, second half).
++    static inline ggml_tensor* apply_rope(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* cos, ggml_tensor* sin) {
++        auto gctx    = ctx->ggml_ctx;
++        int64_t half = cos->ne[0];
++        auto first   = ggml_ext_slice(ctx, x, 0, 0, half);
++        auto second  = ggml_ext_slice(ctx, x, 0, half, 2 * half);
++        auto left    = ggml_sub(gctx, ggml_mul(gctx, first, cos), ggml_mul(gctx, second, sin));
++        auto right   = ggml_add(gctx, ggml_mul(gctx, second, cos), ggml_mul(gctx, first, sin));
++        return ggml_concat(gctx, left, right, 0);
++    }
++
++    class Attention : public GGMLBlock {
++        int64_t dim;
++        int heads;
++
++    public:
++        explicit Attention(int64_t dim)
++            : dim(dim), heads(static_cast<int>(dim / HEAD_DIM)) {
++            blocks["qkv"] = linear(dim, 3 * dim, false);
++            blocks["out"] = linear(dim, dim, false);
++            blocks["qn"]  = std::make_shared<RMSNormW>(HEAD_DIM);
++            blocks["kn"]  = std::make_shared<RMSNormW>(HEAD_DIM);
++        }
++
++        // x: [dim, N, B]; cos/sin: [hd/2, 1, N, B'] or nullptr for no rotation.
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* cos, ggml_tensor* sin) {
++            auto gctx      = ctx->ggml_ctx;
++            const auto N   = x->ne[1];
++            const auto B   = x->ne[2];
++            auto qkv       = std::dynamic_pointer_cast<Linear>(blocks["qkv"])->forward(ctx, x);
++            auto split_one = [&](int index) {
++                auto t = ggml_ext_slice(ctx, qkv, 0, index * dim, (index + 1) * dim);
++                return ggml_reshape_4d(gctx, t, HEAD_DIM, heads, N, B);
++            };
++            auto q = std::dynamic_pointer_cast<RMSNormW>(blocks["qn"])->forward(ctx, split_one(0));
++            auto k = std::dynamic_pointer_cast<RMSNormW>(blocks["kn"])->forward(ctx, split_one(1));
++            auto v = split_one(2);
++            if (cos != nullptr) {
++                q = apply_rope(ctx, q, cos, sin);
++                k = apply_rope(ctx, k, cos, sin);
++            }
++            q      = ggml_reshape_3d(gctx, q, dim, N, B);
++            k      = ggml_reshape_3d(gctx, k, dim, N, B);
++            v      = ggml_reshape_3d(gctx, v, dim, N, B);
++            auto o = ggml_ext_attention_ext(ctx, q, k, v, heads, nullptr, false, false);
++            return std::dynamic_pointer_cast<Linear>(blocks["out"])->forward(ctx, o);
++        }
++    };
++
++    // SwiGLU; on grids the gated half runs through a depthwise 3x3 conv first.
++    class SwiGLU : public GGMLBlock {
++        int64_t hidden;
++        bool conv;
++
++    public:
++        SwiGLU(int64_t dim, bool conv)
++            : hidden(static_cast<int64_t>(dim * MLP_RATIO)), conv(conv) {
++            blocks["w1"] = linear(dim, 2 * hidden, false);
++            blocks["w2"] = linear(hidden, dim, false);
++            if (conv) {
++                blocks["conv"] = std::make_shared<DepthwiseConv3>(hidden);
++            }
++        }
++
++        // x: [dim, N]; side: grid side when conv.
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, int64_t side) {
++            auto gctx = ctx->ggml_ctx;
++            auto ag   = std::dynamic_pointer_cast<Linear>(blocks["w1"])->forward(ctx, x);
++            auto a    = ggml_ext_slice(ctx, ag, 0, 0, hidden);
++            auto g    = ggml_ext_slice(ctx, ag, 0, hidden, 2 * hidden);
++            if (conv) {
++                const auto N = a->ne[1];
++                auto grid    = ggml_reshape_4d(gctx, a, hidden, side, side, 1);
++                grid         = ggml_cont(gctx, ggml_permute(gctx, grid, 2, 0, 1, 3));  // [x, y, C, 1]
++                grid         = std::dynamic_pointer_cast<DepthwiseConv3>(blocks["conv"])->forward(ctx, grid);
++                grid         = ggml_cont(gctx, ggml_permute(gctx, grid, 1, 2, 0, 3));  // [C, x, y, 1]
++                a            = ggml_reshape_2d(gctx, grid, hidden, N);
++            }
++            return std::dynamic_pointer_cast<Linear>(blocks["w2"])->forward(ctx, ggml_mul(gctx, ggml_silu(gctx, g), a));
++        }
++    };
++
++    // Pre-norm block with adaLN-single modulation: mod (shared per level) plus this block's table.
++    class Block : public GGMLBlock {
++        int64_t dim;
++
++        void init_params(ggml_context* ctx, const String2TensorStorage& = {}, const std::string = "") override {
++            params["table"] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, 6);
++        }
++
++    public:
++        Block(int64_t dim, bool conv)
++            : dim(dim) {
++            blocks["n1"]   = std::make_shared<RMSNormW>(dim);
++            blocks["n2"]   = std::make_shared<RMSNormW>(dim);
++            blocks["attn"] = std::make_shared<Attention>(dim);
++            blocks["mlp"]  = std::make_shared<SwiGLU>(dim, conv);
++        }
++
++        Attention* attention() { return std::dynamic_pointer_cast<Attention>(blocks["attn"]).get(); }
++
++        // x: [dim, N]; mod: [dim, 6] or nullptr (zero); attn: h -> attention output.
++        template <typename AttnFn>
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* mod, AttnFn attn, int64_t side) {
++            auto gctx   = ctx->ggml_ctx;
++            auto m      = mod != nullptr ? ggml_add(gctx, mod, params["table"]) : params["table"];
++            auto adapt  = [&](ggml_tensor* h, int shift_row, int scale_row) {
++                h = ggml_add(gctx, h, ggml_mul(gctx, h, row(ctx, m, scale_row)));
++                return ggml_add(gctx, h, row(ctx, m, shift_row));
++            };
++            auto n1 = std::dynamic_pointer_cast<RMSNormW>(blocks["n1"])->forward(ctx, x);
++            x       = ggml_add(gctx, x, ggml_mul(gctx, attn(adapt(n1, 0, 1)), row(ctx, m, 2)));
++            auto n2 = std::dynamic_pointer_cast<RMSNormW>(blocks["n2"])->forward(ctx, x);
++            auto mo = std::dynamic_pointer_cast<SwiGLU>(blocks["mlp"])->forward(ctx, adapt(n2, 3, 4), side);
++            return ggml_add(gctx, x, ggml_mul(gctx, mo, row(ctx, m, 5)));
++        }
++    };
++
++    struct WindowRope {
++        ggml_tensor* cos[2];
++        ggml_tensor* sin[2];
++    };
++
++    // Window-attention blocks on an n x n grid, shifted windows on odd blocks.
++    class WindowLevel : public GGMLBlock {
++        int64_t dim;
++        int64_t side;
++
++        ggml_tensor* windows(GGMLRunnerContext* ctx, ggml_tensor* h, int64_t shift) {
++            auto gctx      = ctx->ggml_ctx;
++            const auto nw  = side / WINDOW;
++            auto g         = ggml_reshape_3d(gctx, h, dim, side, side);
++            g              = roll(ctx, roll(ctx, g, 1, -shift), 2, -shift);
++            g              = ggml_reshape_4d(gctx, ggml_cont(gctx, g), dim * WINDOW, nw, WINDOW, nw);
++            g              = ggml_cont(gctx, ggml_permute(gctx, g, 0, 2, 1, 3));
++            return ggml_reshape_3d(gctx, g, dim, WINDOW * WINDOW, nw * nw);
++        }
++
++        ggml_tensor* unwindows(GGMLRunnerContext* ctx, ggml_tensor* o, int64_t shift) {
++            auto gctx     = ctx->ggml_ctx;
++            const auto nw = side / WINDOW;
++            auto g        = ggml_reshape_4d(gctx, ggml_cont(gctx, o), dim * WINDOW, WINDOW, nw, nw);
++            g             = ggml_cont(gctx, ggml_permute(gctx, g, 0, 2, 1, 3));
++            g             = ggml_reshape_3d(gctx, g, dim, side, side);
++            g             = roll(ctx, roll(ctx, g, 1, shift), 2, shift);
++            return ggml_reshape_2d(gctx, ggml_cont(gctx, g), dim, side * side);
++        }
++
++    public:
++        WindowLevel(int64_t dim, int64_t side)
++            : dim(dim), side(side) {
++            for (int i = 0; i < LEVEL_DEPTH; ++i) {
++                blocks["blocks." + std::to_string(i)] = std::make_shared<Block>(dim, true);
++            }
++            blocks["ada"] = linear(DC, 6 * dim);
++        }
++
++        // x: [dim, side*side]; c: [DC]
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* c, const WindowRope& rope) {
++            auto gctx = ctx->ggml_ctx;
++            auto mod  = std::dynamic_pointer_cast<Linear>(blocks["ada"])->forward(ctx, ggml_silu(gctx, c));
++            mod       = ggml_reshape_2d(gctx, mod, dim, 6);
++            for (int i = 0; i < LEVEL_DEPTH; ++i) {
++                const int odd     = i % 2;
++                const auto shift  = odd ? WINDOW / 2 : 0;
++                auto block        = std::dynamic_pointer_cast<Block>(blocks["blocks." + std::to_string(i)]);
++                auto window_attn  = [&](ggml_tensor* h) {
++                    auto o = block->attention()->forward(ctx, windows(ctx, h, shift), rope.cos[odd], rope.sin[odd]);
++                    return unwindows(ctx, o, shift);
++                };
++                x = block->forward(ctx, x, mod, window_attn, side);
++            }
++            return x;
++        }
++    };
++
++    // [D, n*n] -> [4D, (n/2)^2], 2x2 patches (iy, ix, D order).
++    static inline ggml_tensor* merge(GGMLRunnerContext* ctx, ggml_tensor* x, int64_t side) {
++        auto gctx    = ctx->ggml_ctx;
++        const auto D = x->ne[0];
++        auto g       = ggml_reshape_4d(gctx, x, D * 2, side / 2, 2, side / 2);
++        g            = ggml_cont(gctx, ggml_permute(gctx, g, 0, 2, 1, 3));
++        return ggml_reshape_2d(gctx, g, 4 * D, (side / 2) * (side / 2));
++    }
++
++    // [4D, (n/2)^2] -> [D, n*n]
++    static inline ggml_tensor* split(GGMLRunnerContext* ctx, ggml_tensor* x, int64_t side) {
++        auto gctx    = ctx->ggml_ctx;
++        const auto D = x->ne[0] / 4;
++        auto g       = ggml_reshape_4d(gctx, x, D * 2, 2, side / 2, side / 2);
++        g            = ggml_cont(gctx, ggml_permute(gctx, g, 0, 2, 1, 3));
++        return ggml_reshape_2d(gctx, g, D, side * side);
++    }
++
++    struct ForwardInputs {
++        ggml_tensor* x;          // [4, 4096]
++        ggml_tensor* sc;         // [4, 4096]
++        ggml_tensor* temb;       // [256]
++        ggml_tensor* text;       // [2560, L] or nullptr (unconditional)
++        ggml_tensor* pooled;     // [2560] or nullptr (unconditional)
++        ggml_tensor* style;      // I32 [1]
++        ggml_tensor* source;     // I32 [1]
++        ggml_tensor* attr;       // I32 [1]
++        ggml_tensor* bg;         // I32 [1]
++        ggml_tensor* pal_feats;  // [51, P] or nullptr
++        ggml_tensor* pal_ramp;   // I32 [P]
++        ggml_tensor* pal_level;  // [1, P]
++        WindowRope rope0;
++        WindowRope rope1;
++        ggml_tensor* core_cos;  // [32, 1, S + 256, 1]
++        ggml_tensor* core_sin;
++    };
++
++    class RDFlowModel : public GGMLBlock {
++        void init_params(ggml_context* ctx, const String2TensorStorage& = {}, const std::string = "") override {
++            params["null_text"] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, TEXT_DIM, 1);
++            params["registers"] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, DC, N_REGISTERS);
++            params["modality"]  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, DC, 4);
++        }
++
++        template <typename T>
++        T* get(const std::string& name) { return std::dynamic_pointer_cast<T>(blocks[name]).get(); }
++
++        ggml_tensor* lin(GGMLRunnerContext* ctx, const std::string& name, ggml_tensor* x) {
++            return get<Linear>(name)->forward(ctx, x);
++        }
++
++        ggml_tensor* mlp2(GGMLRunnerContext* ctx, const std::string& name, ggml_tensor* x) {
++            return lin(ctx, name + ".2", ggml_silu(ctx->ggml_ctx, lin(ctx, name + ".0", x)));
++        }
++
++        // Palette colours -> [COLOUR_HIDDEN, P]: Fourier OKLab MLP + ramp id + level on the ramp.
++        ggml_tensor* palette_embed(GGMLRunnerContext* ctx, const ForwardInputs& in) {
++            auto gctx = ctx->ggml_ctx;
++            auto e    = mlp2(ctx, "colour.mlp", in.pal_feats);
++            e         = ggml_add(gctx, e, get<Embedding>("ramp_emb")->forward(ctx, in.pal_ramp));
++            return ggml_add(gctx, e, lin(ctx, "level_proj", in.pal_level));
++        }
++
++    public:
++        RDFlowModel() {
++            blocks["inp"]   = linear(CHANNELS * 2, D0);
++            blocks["t_mlp.0"] = linear(TIME_DIM, DC);
++            blocks["t_mlp.2"] = linear(DC, DC);
++            blocks["style"]     = std::make_shared<Embedding>(512, DC);
++            blocks["source"]    = std::make_shared<Embedding>(16, DC);
++            blocks["text_pool"] = linear(TEXT_DIM, DC);
++            blocks["text_proj"] = linear(TEXT_DIM, DC);
++            const int attr_vocab[N_ATTRS] = {8, 5, 5, 4};
++            for (int j = 0; j < N_ATTRS; ++j) {
++                blocks["attr_emb." + std::to_string(j)] = std::make_shared<Embedding>(attr_vocab[j], DC);
++            }
++            blocks["bg_emb"] = std::make_shared<Embedding>(3, DC);
++            for (int i = 0; i < TEXT_ADAPTER; ++i) {
++                blocks["adapter." + std::to_string(i)] = std::make_shared<Block>(DC, false);
++            }
++            blocks["down0"]  = std::make_shared<WindowLevel>(D0, SIZE);
++            blocks["merge0"] = linear(4 * D0, D1);
++            blocks["down1"]  = std::make_shared<WindowLevel>(D1, SIZE / 2);
++            blocks["merge1"] = linear(4 * D1, DC);
++            for (int i = 0; i < CORE_DEPTH; ++i) {
++                blocks["core." + std::to_string(i)] = std::make_shared<Block>(DC, false);
++            }
++            blocks["core_ada"]    = linear(DC, 6 * DC);
++            blocks["split1"]      = linear(DC, 4 * D1);
++            blocks["skip1"]       = linear(2 * D1, D1);
++            blocks["up1"]         = std::make_shared<WindowLevel>(D1, SIZE / 2);
++            blocks["split0"]      = linear(D1, 4 * D0);
++            blocks["skip0"]       = linear(2 * D0, D0);
++            blocks["up0"]         = std::make_shared<WindowLevel>(D0, SIZE);
++            blocks["out_norm"]    = std::make_shared<RMSNormW>(D0);
++            blocks["x_head"]      = linear(D0, CHANNELS);
++            blocks["colour.mlp.0"] = linear(COLOUR_FEATS, COLOUR_HIDDEN);
++            blocks["colour.mlp.2"] = linear(COLOUR_HIDDEN, COLOUR_HIDDEN);
++            blocks["ramp_emb"]     = std::make_shared<Embedding>(N_RAMPS, COLOUR_HIDDEN);
++            blocks["level_proj"]   = linear(1, COLOUR_HIDDEN);
++            blocks["pal_tok"]      = linear(COLOUR_HIDDEN, DC);
++            blocks["q"]            = linear(D0, DK);
++            blocks["k.0"]          = linear(COLOUR_HIDDEN, DK);
++            blocks["k.2"]          = linear(DK, DK);
++            blocks["transparent"]  = linear(D0, 1);
++        }
++
++        // Returns [4*4096 + (1+P)*4096]: the predicted clean image, then the pointer logits when a palette is given.
++        ggml_tensor* forward(GGMLRunnerContext* ctx, const ForwardInputs& in) {
++            auto gctx      = ctx->ggml_ctx;
++            const int64_t N0 = SIZE * SIZE;
++            const int64_t nc = SIZE / 4;
++
++            auto text   = in.text != nullptr ? in.text : params["null_text"];
++            auto pooled = in.pooled != nullptr ? in.pooled : ggml_reshape_1d(gctx, params["null_text"], TEXT_DIM);
++            auto c      = mlp2(ctx, "t_mlp", in.temb);
++            c           = ggml_add(gctx, c, get<Embedding>("style")->forward(ctx, in.style));
++            c           = ggml_add(gctx, c, get<Embedding>("source")->forward(ctx, in.source));
++            c           = ggml_add(gctx, c, lin(ctx, "text_pool", pooled));
++            for (int j = 0; j < N_ATTRS; ++j) {
++                c = ggml_add(gctx, c, get<Embedding>("attr_emb." + std::to_string(j))->forward(ctx, in.attr));
++            }
++            c = ggml_add(gctx, c, get<Embedding>("bg_emb")->forward(ctx, in.bg));
++            c = ggml_reshape_1d(gctx, c, DC);
++
++            auto xin = ggml_concat(gctx, in.x, in.sc, 0);
++            auto h0  = get<WindowLevel>("down0")->forward(ctx, lin(ctx, "inp", xin), c, in.rope0);
++            auto h1  = get<WindowLevel>("down1")->forward(ctx, lin(ctx, "merge0", merge(ctx, h0, SIZE)), c, in.rope1);
++
++            auto txt = lin(ctx, "text_proj", text);
++            for (int i = 0; i < TEXT_ADAPTER; ++i) {
++                auto block = get<Block>("adapter." + std::to_string(i));
++                auto attn  = [&](ggml_tensor* h) {
++                    auto o = block->attention()->forward(ctx, ggml_reshape_3d(gctx, h, DC, h->ne[1], 1), nullptr, nullptr);
++                    return ggml_reshape_2d(gctx, o, DC, h->ne[1]);
++                };
++                txt = block->forward(ctx, txt, nullptr, attn, 0);
++            }
++            auto hc = lin(ctx, "merge1", merge(ctx, h1, SIZE / 2));
++
++            auto modality = params["modality"];
++            auto tok      = ggml_add(gctx, params["registers"], row(ctx, modality, 0));
++            tok           = ggml_concat(gctx, tok, ggml_add(gctx, txt, row(ctx, modality, 1)), 1);
++            ggml_tensor* pal_embed = nullptr;
++            if (in.pal_feats != nullptr) {
++                pal_embed = palette_embed(ctx, in);
++                tok       = ggml_concat(gctx, tok, ggml_add(gctx, lin(ctx, "pal_tok", pal_embed), row(ctx, modality, 3)), 1);
++            }
++            const int64_t S = tok->ne[1];
++            tok             = ggml_concat(gctx, tok, ggml_add(gctx, hc, row(ctx, modality, 2)), 1);
++
++            auto mod = ggml_reshape_2d(gctx, lin(ctx, "core_ada", ggml_silu(gctx, c)), DC, 6);
++            for (int i = 0; i < CORE_DEPTH; ++i) {
++                auto block = get<Block>("core." + std::to_string(i));
++                auto attn  = [&](ggml_tensor* h) {
++                    auto o = block->attention()->forward(ctx, ggml_reshape_3d(gctx, h, DC, h->ne[1], 1), in.core_cos, in.core_sin);
++                    return ggml_reshape_2d(gctx, o, DC, h->ne[1]);
++                };
++                tok = block->forward(ctx, tok, mod, attn, 0);
++            }
++            hc = ggml_ext_slice(ctx, tok, 1, S, S + nc * nc);
++
++            auto u1 = split(ctx, lin(ctx, "split1", hc), SIZE / 2);
++            u1      = get<WindowLevel>("up1")->forward(ctx, lin(ctx, "skip1", ggml_concat(gctx, u1, h1, 0)), c, in.rope1);
++            auto u0 = split(ctx, lin(ctx, "split0", u1), SIZE);
++            u0      = get<WindowLevel>("up0")->forward(ctx, lin(ctx, "skip0", ggml_concat(gctx, u0, h0, 0)), c, in.rope0);
++            u0      = get<RMSNormW>("out_norm")->forward(ctx, u0);
++
++            auto out = ggml_reshape_1d(gctx, lin(ctx, "x_head", u0), CHANNELS * N0);
++            if (pal_embed != nullptr) {
++                auto keys   = mlp2(ctx, "k", pal_embed);                                     // [DK, P]
++                auto query  = lin(ctx, "q", u0);                                             // [DK, N0]
++                auto logits = ggml_mul_mat(gctx, keys, query);                               // [P, N0]
++                logits      = ggml_scale(gctx, logits, 1.f / std::sqrt(static_cast<float>(DK)));
++                logits      = ggml_concat(gctx, lin(ctx, "transparent", u0), logits, 0);  // [1 + P, N0]
++                out         = ggml_concat(gctx, out, ggml_reshape_1d(gctx, ggml_cont(gctx, logits), ggml_nelements(logits)), 0);
++            }
++            return out;
++        }
++    };
++
++    // Host-side inputs of one network call.
++    struct CallInputs {
++        sd::Tensor<float> x;          // {4, 64, 64}
++        sd::Tensor<float> sc;         // {4, 64, 64}
++        float t                  = 0.f;
++        bool conditional         = true;
++        bool transparent         = true;
++        sd::Tensor<float> pal_feats;  // {51, P} or empty
++        sd::Tensor<int32_t> pal_ramp; // {P}
++        sd::Tensor<float> pal_level;  // {1, P}
++    };
++
++    struct RDFlowRunner : public DiffusionModelRunner {
++        RDFlowModel model;
++        sd::Tensor<float> text_;     // {2560, L}
++        sd::Tensor<float> pooled_;   // {2560}
++        sd::Tensor<float> window_cos_[2][2];
++        sd::Tensor<float> window_sin_[2][2];
++
++        RDFlowRunner(ggml_backend_t backend,
++                     const String2TensorStorage& tensors,
++                     const std::string& prefix,
++                     std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
++            : DiffusionModelRunner(backend, prefix, weight_manager) {
++            model.init(params_ctx, tensors, prefix);
++            for (int level = 0; level < 2; ++level) {
++                for (int odd = 0; odd < 2; ++odd) {
++                    build_window_rope(SIZE >> level, odd ? WINDOW / 2 : 0, window_cos_[level][odd], window_sin_[level][odd]);
++                }
++            }
++        }
++
++        std::string get_desc() override { return "rd_flow"; }
++
++        void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string& prefix) override {
++            model.get_param_tensors(tensors, prefix);
++        }
++
++        sd::Tensor<float> compute(int, const DiffusionParams&) override {
++            LOG_ERROR("RD Flow 64 runs through its own sampler, not the generic denoiser");
++            return {};
++        }
++
++        // features: {2560, L} prompt features (already RMS-normalised and bf16-rounded).
++        void set_text(const sd::Tensor<float>& features) {
++            text_            = features;
++            const int64_t L  = features.shape()[1];
++            pooled_          = sd::Tensor<float>::zeros({TEXT_DIM});
++            for (int64_t i = 0; i < L; ++i) {
++                for (int64_t d = 0; d < TEXT_DIM; ++d) {
++                    pooled_.data()[d] += features.data()[i * TEXT_DIM + d];
++                }
++            }
++            for (int64_t d = 0; d < TEXT_DIM; ++d) {
++                pooled_.data()[d] /= static_cast<float>(std::max<int64_t>(L, 1));
++            }
++        }
++
++        // One network call. Returns [4*4096 (+ (1+P)*4096 pointer logits)].
++        sd::Tensor<float> run(int n_threads, const CallInputs& in) {
++            sd::Tensor<float> temb = timestep_embedding(in.t);
++            sd::Tensor<int32_t> style({1}, std::vector<int32_t>{0});
++            sd::Tensor<int32_t> source({1}, std::vector<int32_t>{SOURCE});
++            sd::Tensor<int32_t> attr({1}, std::vector<int32_t>{0});
++            sd::Tensor<int32_t> bg({1}, std::vector<int32_t>{in.transparent ? 2 : 1});
++            const int64_t P   = in.pal_feats.empty() ? 0 : in.pal_feats.shape()[1];
++            const int64_t L   = in.conditional ? text_.shape()[1] : 1;
++            const int64_t S   = N_REGISTERS + L + P;
++            sd::Tensor<float> core_cos, core_sin;
++            build_core_rope(S, core_cos, core_sin);
++
++            auto graph = [&]() {
++                auto gf = new_graph_custom(GRAPH_SIZE);
++                auto ctx = get_context();
++                ForwardInputs fi{};
++                fi.x      = ggml_reshape_2d(ctx.ggml_ctx, make_input(in.x), CHANNELS, SIZE * SIZE);
++                fi.sc     = ggml_reshape_2d(ctx.ggml_ctx, make_input(in.sc), CHANNELS, SIZE * SIZE);
++                fi.temb   = make_input(temb);
++                fi.text   = in.conditional ? make_input(text_) : nullptr;
++                fi.pooled = in.conditional ? make_input(pooled_) : nullptr;
++                fi.style  = make_input(style);
++                fi.source = make_input(source);
++                fi.attr   = make_input(attr);
++                fi.bg     = make_input(bg);
++                if (P > 0) {
++                    fi.pal_feats = make_input(in.pal_feats);
++                    fi.pal_ramp  = make_input(in.pal_ramp);
++                    fi.pal_level = make_input(in.pal_level);
++                }
++                for (int odd = 0; odd < 2; ++odd) {
++                    fi.rope0.cos[odd] = make_input(window_cos_[0][odd]);
++                    fi.rope0.sin[odd] = make_input(window_sin_[0][odd]);
++                    fi.rope1.cos[odd] = make_input(window_cos_[1][odd]);
++                    fi.rope1.sin[odd] = make_input(window_sin_[1][odd]);
++                }
++                fi.core_cos = make_input(core_cos);
++                fi.core_sin = make_input(core_sin);
++                auto out    = model.forward(&ctx, fi);
++                ggml_build_forward_expand(gf, out);
++                return gf;
++            };
++            return take_or_empty(GGMLRunner::compute(graph, n_threads, false));
++        }
++
++    private:
++        static sd::Tensor<float> timestep_embedding(float t) {
++            const int half = TIME_DIM / 2;
++            std::vector<float> v(TIME_DIM);
++            for (int i = 0; i < half; ++i) {
++                float f      = std::exp(-std::log(10000.f) * static_cast<float>(i) / static_cast<float>(half));
++                float a      = t * 1000.f * f;
++                v[i]         = std::sin(a);
++                v[half + i]  = std::cos(a);
++            }
++            return sd::Tensor<float>({TIME_DIM}, std::move(v));
++        }
++
++        // cos/sin [hd/2] of one 2-D position (first quarter x, second quarter y); identity without a position.
++        static void rope_row(float px, float py, bool has, float* cos_out, float* sin_out) {
++            const int quarter = HEAD_DIM / 4;
++            for (int j = 0; j < quarter; ++j) {
++                float freq       = std::pow(ROPE_THETA, -static_cast<float>(j) / static_cast<float>(quarter));
++                float ax         = has ? px * freq : 0.f;
++                float ay         = has ? py * freq : 0.f;
++                cos_out[j]           = std::cos(ax);
++                sin_out[j]           = std::sin(ax);
++                cos_out[quarter + j] = std::cos(ay);
++                sin_out[quarter + j] = std::sin(ay);
++            }
++        }
++
++        // Tables in window layout: [hd/2, 1, w*w, nw*nw]; a token at window (wx, wy), cell (ix, iy) sits at the
++        // rolled grid position ((wx*w + ix + shift) mod n, (wy*w + iy + shift) mod n).
++        static void build_window_rope(int side, int shift, sd::Tensor<float>& cos, sd::Tensor<float>& sin) {
++            const int half = HEAD_DIM / 2;
++            const int nw   = side / WINDOW;
++            cos            = sd::Tensor<float>::zeros({half, 1, WINDOW * WINDOW, nw * nw});
++            sin            = sd::Tensor<float>::zeros({half, 1, WINDOW * WINDOW, nw * nw});
++            for (int wy = 0; wy < nw; ++wy) {
++                for (int wx = 0; wx < nw; ++wx) {
++                    for (int iy = 0; iy < WINDOW; ++iy) {
++                        for (int ix = 0; ix < WINDOW; ++ix) {
++                            const int x      = (wx * WINDOW + ix + shift) % side;
++                            const int y      = (wy * WINDOW + iy + shift) % side;
++                            const int64_t at = (static_cast<int64_t>(wy * nw + wx) * WINDOW * WINDOW + iy * WINDOW + ix) * half;
++                            rope_row(static_cast<float>(x), static_cast<float>(y), true, cos.data() + at, sin.data() + at);
++                        }
++                    }
++                }
++            }
++        }
++
++        // Core tables: S position-less tokens, then the 16x16 grid.
++        static void build_core_rope(int64_t S, sd::Tensor<float>& cos, sd::Tensor<float>& sin) {
++            const int half   = HEAD_DIM / 2;
++            const int nc     = SIZE / 4;
++            const int64_t n  = S + nc * nc;
++            cos              = sd::Tensor<float>::zeros({half, 1, n, 1});
++            sin              = sd::Tensor<float>::zeros({half, 1, n, 1});
++            for (int64_t i = 0; i < n; ++i) {
++                const bool has = i >= S;
++                const int g    = static_cast<int>(has ? i - S : 0);
++                rope_row(static_cast<float>(g % nc), static_cast<float>(g / nc), has, cos.data() + i * half, sin.data() + i * half);
++            }
++        }
++    };
++}  // namespace RDFlow
++
++#endif  // __SD_MODEL_DIFFUSION_RD_FLOW_HPP__
+diff --git a/src/model/integrations/rd_flow.cpp b/src/model/integrations/rd_flow.cpp
+new file mode 100644
+index 0000000..79e54d1
+--- /dev/null
++++ b/src/model/integrations/rd_flow.cpp
+@@ -0,0 +1,31 @@
++#include "model/diffusion/rd_flow.hpp"
++#include "conditioning/conditioner.hpp"
++#include "model_definition.h"
++#include "pipeline/model_builders.h"
++
++static bool build_rd_flow(const sd::model_builders::Context& ctx, const TokenizerConfig& tokenizers, sd::model_builders::CoreRunners& result) {
++    result.conditioner = std::make_shared<LLMEmbedder>(ctx.backends.runtime_backend(SDBackendModule::TE),
++                                                       ctx.tensor_storage_map, ctx.version, "", false, ctx.weight_manager, tokenizers);
++    result.diffusion   = std::make_shared<RDFlow::RDFlowRunner>(ctx.backends.runtime_backend(SDBackendModule::DIFFUSION),
++                                                                ctx.tensor_storage_map, "model.diffusion_model", ctx.weight_manager);
++    return true;
++}
++
++const std::vector<ModelDefinition>& rd_flow_definitions() {
++    static const std::vector<ModelDefinition> definitions = [] {
++        std::vector<ModelDefinition> result;
++        {
++            ModelDefinition definition;
++            definition.version         = VERSION_RD_FLOW_64;
++            definition.geometry        = {1, 3, 3};
++            definition.name            = "RD Flow 64";
++            definition.traits.is_dit   = true;
++            definition.traits.fake_vae = true;
++            definition.sampling        = {FLOW_PRED, 3.f};
++            definition.build           = build_rd_flow;
++            result.push_back(std::move(definition));
++        }
++        return result;
++    }();
++    return definitions;
++}
+diff --git a/src/model/vae/vae.hpp b/src/model/vae/vae.hpp
+index 3c66965..b07b694 100644
+--- a/src/model/vae/vae.hpp
++++ b/src/model/vae/vae.hpp
+@@ -189,7 +189,8 @@ public:
+                    sd_version_is_minit2i(version) ||
+                    sd_version_is_sensenova_u1(version) ||
+                    sd_version_is_z_image_l2p(version) ||
+-                   version == VERSION_IRIS) {
++                   version == VERSION_IRIS ||
++                   version == VERSION_RD_FLOW_64) {
+             scale_factor = 1;
+         }
+         return scale_factor;
+diff --git a/src/model_loader.cpp b/src/model_loader.cpp
+index 5987146..953401c 100644
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -447,6 +447,11 @@ SDVersion ModelLoader::get_sd_version() const {
+         return VERSION_FIBO2;
+     }
+ 
++    if (tensor_storage_map.count("model.diffusion_model.pal_tok.weight") &&
++        tensor_storage_map.count("model.diffusion_model.down0.ada.weight")) {
++        return VERSION_RD_FLOW_64;
++    }
++
+     if (tensor_storage_map.find("model.diffusion_model.emb_in.image.weight") != tensor_storage_map.end() &&
+         tensor_storage_map.find("model.diffusion_model.txt_mode_blocks.0.q_proj.weight") != tensor_storage_map.end()) {
+         return VERSION_FLUX3;
+diff --git a/src/model_registry.cpp b/src/model_registry.cpp
+index 9a80bb8..150c7f3 100644
+--- a/src/model_registry.cpp
++++ b/src/model_registry.cpp
+@@ -18,6 +18,7 @@ const std::vector<ModelDefinition>& lingbot_video_definitions();
+ const std::vector<ModelDefinition>& qwen_image_definitions();
+ const std::vector<ModelDefinition>& pixart_definitions();
+ const std::vector<ModelDefinition>& mage_flow_definitions();
++const std::vector<ModelDefinition>& rd_flow_definitions();
+ const std::vector<ModelDefinition>& longcat_definitions();
+ const std::vector<ModelDefinition>& hidream_o1_definitions();
+ const std::vector<ModelDefinition>& minit2i_definitions();
+@@ -76,6 +77,7 @@ static const std::array<const ModelDefinition*, VERSION_COUNT>& model_definition
+         append(iris_definitions());
+         append(sd_definitions());
+         append(moss_image_definitions());
++        append(rd_flow_definitions());
+         for (const auto* definition : result) {
+             if (!definition)
+                 throw std::logic_error("missing model registration");
+diff --git a/src/pipeline/image.cpp b/src/pipeline/image.cpp
+index 5e7a349..a886302 100644
+--- a/src/pipeline/image.cpp
++++ b/src/pipeline/image.cpp
+@@ -10,6 +10,7 @@
+ #include "diffusion_engine.h"
+ #include "model/vae/vae.hpp"
+ #include "pipeline/image_upscale.h"
++#include "rd_flow.h"
+ #include "request.h"
+ #include "runtime/denoiser.hpp"
+ #include "runtime/image_preprocess.h"
+@@ -958,6 +959,10 @@ namespace sd::pipeline {
+             return false;
+         sd->apply_circular_axes(sd_img_gen_params->circular_x, sd_img_gen_params->circular_y);
+ 
++        if (sd->version == VERSION_RD_FLOW_64) {
++            return generate_rd_flow(sd, sd_img_gen_params, request, info, images_out, num_images_out, infos_out);
++        }
++
+         const RefImageParams ref_image_params = sd->resolve_ref_image_params(sd_img_gen_params->ref_image_args);
+ 
+         ImageVaeAxesGuard axes_guard(sd, sd_img_gen_params, request);
+diff --git a/src/pipeline/rd_flow.cpp b/src/pipeline/rd_flow.cpp
+new file mode 100644
+index 0000000..6cf7555
+--- /dev/null
++++ b/src/pipeline/rd_flow.cpp
+@@ -0,0 +1,651 @@
++#include "rd_flow.h"
++
++#include <algorithm>
++#include <array>
++#include <cfloat>
++#include <cinttypes>
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <numeric>
++#include <set>
++#include <string>
++
++#include "diffusion_engine.h"
++#include "generation.h"
++#include "model/diffusion/rd_flow.hpp"
++#include "request.h"
++
++// Ref: https://github.com/Retro-Diffusion/rd-flow-64 (rdflow/flow.py, rdflow/palette.py, rdflow/ramps.py)
++
++namespace sd::pipeline {
++    namespace {
++        constexpr int N_PIX            = RDFlow::SIZE * RDFlow::SIZE;
++        constexpr float AB_SCALE       = 3.f;
++        constexpr float FLOW_SHIFT     = 3.f;
++        constexpr float GUIDE_FROM     = 0.f;
++        constexpr float GUIDE_UNTIL    = 0.9f;
++        constexpr float PALETTE_AT     = 0.6f;
++        constexpr float POINTER_FROM   = 0.35f;
++        constexpr float COMMIT_FROM    = 0.55f;
++        constexpr float COMMIT_THRESH  = 0.9f;
++        constexpr int MAX_COLOURS      = 64;
++        constexpr double MERGE         = 0.05;
++        constexpr double BIN_SIZE      = 0.015;
++        constexpr int KMEANS_ITERS     = 4;
++        constexpr int MAX_PALETTE      = 256;
++        constexpr float NEUTRAL_C      = 0.035f;
++        constexpr int MAX_RAMPS        = 15;
++        constexpr double PI            = 3.14159265358979323846;
++
++        using RGB = std::array<int, 3>;
++
++        float srgb_channel_linear(float c) {
++            return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
++        }
++
++        // ColourEmbed.oklab: float32, cube root of the clamped LMS.
++        std::array<float, 3> oklab_f32(const RGB& rgb) {
++            float r = srgb_channel_linear(rgb[0] / 255.f);
++            float g = srgb_channel_linear(rgb[1] / 255.f);
++            float b = srgb_channel_linear(rgb[2] / 255.f);
++            float l = std::pow(std::max(0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * b, 0.f), 1.f / 3.f);
++            float m = std::pow(std::max(0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * b, 0.f), 1.f / 3.f);
++            float s = std::pow(std::max(0.0883024619f * r + 0.2817188376f * g + 0.6299787005f * b, 0.f), 1.f / 3.f);
++            return {0.2104542553f * l + 0.7936177850f * m - 0.0040720468f * s,
++                    1.9779984951f * l - 2.4285922050f * m + 0.4505937099f * s,
++                    0.0259040371f * l + 0.7827717662f * m - 0.8086757660f * s};
++        }
++
++        // palette.srgb_to_oklab: float64 math, float32 out.
++        std::array<float, 3> oklab_f64(const RGB& rgb) {
++            auto lin = [](double c) { return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4); };
++            double r = lin(rgb[0] / 255.0), g = lin(rgb[1] / 255.0), b = lin(rgb[2] / 255.0);
++            double l = std::cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
++            double m = std::cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
++            double s = std::cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
++            return {static_cast<float>(0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s),
++                    static_cast<float>(1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s),
++                    static_cast<float>(0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s)};
++        }
++
++        // flow.oklab_to_srgb: float32 math, rounded half to even.
++        RGB oklab_to_srgb(float L, float a, float b) {
++            float l  = std::pow(L + 0.3963377774f * a + 0.2158037573f * b, 3.f);
++            float m  = std::pow(L - 0.1055613458f * a - 0.0638541728f * b, 3.f);
++            float s  = std::pow(L - 0.0894841775f * a - 1.2914855480f * b, 3.f);
++            float c[3] = {4.0767416621f * l - 3.3077115913f * m + 0.2309699292f * s,
++                          -1.2684380046f * l + 2.6097574011f * m - 0.3413193965f * s,
++                          -0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s};
++            RGB out;
++            for (int i = 0; i < 3; ++i) {
++                float v = std::min(std::max(c[i], 0.f), 1.f);
++                v       = v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(std::max(v, 1e-12f), 1.f / 2.4f) - 0.055f;
++                out[i]  = static_cast<int>(std::nearbyint(v * 255.f));
++            }
++            return out;
++        }
++
++        std::vector<double> unwrap(const std::vector<double>& p) {
++            std::vector<double> out(p);
++            double correction = 0.0;
++            for (size_t i = 1; i < p.size(); ++i) {
++                double d  = p[i] - p[i - 1];
++                double dd = std::fmod(d + PI, 2 * PI);
++                if (dd < 0) {
++                    dd += 2 * PI;
++                }
++                dd -= PI;
++                if (dd == -PI && d > 0) {
++                    dd = PI;
++                }
++                if (std::fabs(d) >= PI) {
++                    correction += dd - d;
++                }
++                out[i] = p[i] + correction;
++            }
++            return out;
++        }
++
++        // ramps.ramps: greys are ramp 0; chromatic colours group by hue, each group ordered dark to light.
++        void palette_ramps(const std::vector<std::array<float, 3>>& lab, std::vector<int>& ramp, std::vector<float>& level) {
++            const double hue_gap  = 28.0 * PI / 180.0;
++            const double hue_span = 75.0 * PI / 180.0;
++            const size_t n        = lab.size();
++            ramp.assign(n, 0);
++            level.assign(n, 0.5f);
++            std::vector<double> hue(n);
++            std::vector<size_t> chromatic, neutral;
++            for (size_t i = 0; i < n; ++i) {
++                float chroma = std::hypot(lab[i][1], lab[i][2]);
++                double h     = std::atan2(static_cast<double>(lab[i][2]), static_cast<double>(lab[i][1]));
++                hue[i]       = std::fmod(h + 2 * PI, 2 * PI);
++                (chroma >= NEUTRAL_C ? chromatic : neutral).push_back(i);
++            }
++            std::vector<std::vector<size_t>> groups;
++            if (!chromatic.empty()) {
++                std::vector<size_t> order(chromatic);
++                std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return hue[a] < hue[b]; });
++                size_t start = 0;
++                double best  = -1;
++                for (size_t i = 0; i < order.size(); ++i) {
++                    double next = i + 1 < order.size() ? hue[order[i + 1]] : hue[order[0]] + 2 * PI;
++                    double gap  = next - hue[order[i]];
++                    if (gap > best) {
++                        best  = gap;
++                        start = i + 1;
++                    }
++                }
++                std::rotate(order.begin(), order.begin() + (start % order.size()), order.end());
++                std::vector<double> h;
++                for (size_t i : order) {
++                    h.push_back(hue[i]);
++                }
++                h = unwrap(h);
++                std::vector<size_t> cur{order[0]};
++                for (size_t i = 1; i < order.size(); ++i) {
++                    if (h[i] - h[i - 1] > hue_gap) {
++                        groups.push_back(cur);
++                        cur.clear();
++                    }
++                    cur.push_back(order[i]);
++                }
++                groups.push_back(cur);
++                std::vector<std::vector<size_t>> split;
++                for (auto g : groups) {
++                    while (g.size() > 2) {
++                        std::vector<double> hg;
++                        for (size_t i : g) {
++                            hg.push_back(hue[i]);
++                        }
++                        hg = unwrap(hg);
++                        if (hg.back() - hg.front() <= hue_span) {
++                            break;
++                        }
++                        size_t k = 1;
++                        for (size_t i = 1; i + 1 < hg.size(); ++i) {
++                            if (hg[i + 1] - hg[i] > hg[k] - hg[k - 1]) {
++                                k = i + 1;
++                            }
++                        }
++                        split.emplace_back(g.begin(), g.begin() + k);
++                        g.erase(g.begin(), g.begin() + k);
++                    }
++                    split.push_back(g);
++                }
++                groups = split;
++            }
++            auto assign = [&](int rid, const std::vector<size_t>& g) {
++                if (g.empty()) {
++                    return;
++                }
++                for (size_t i : g) {
++                    ramp[i] = rid;
++                }
++                if (g.size() > 1) {
++                    std::vector<size_t> idx(g.size());
++                    std::iota(idx.begin(), idx.end(), 0);
++                    std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return lab[g[a]][0] < lab[g[b]][0]; });
++                    for (size_t rank = 0; rank < idx.size(); ++rank) {
++                        level[g[idx[rank]]] = static_cast<float>(rank) / static_cast<float>(g.size() - 1);
++                    }
++                }
++            };
++            assign(0, neutral);
++            for (size_t i = 0; i < groups.size(); ++i) {
++                assign(std::min(static_cast<int>(i) + 1, MAX_RAMPS), groups[i]);
++            }
++        }
++
++        // flow.extract_palette: one image's continuous guess [64*64*4] -> sorted unique sRGB colours.
++        std::vector<RGB> extract_palette(const std::vector<float>& x) {
++            std::vector<std::array<double, 3>> pts;
++            for (int q = 0; q < N_PIX; ++q) {
++                if (x[q * 4 + 3] > 0.f) {
++                    pts.push_back({static_cast<double>((x[q * 4 + 0] + 1.f) / 2.f),
++                                   static_cast<double>(x[q * 4 + 1] / AB_SCALE),
++                                   static_cast<double>(x[q * 4 + 2] / AB_SCALE)});
++                }
++            }
++            if (pts.empty()) {
++                return {};
++            }
++            std::map<std::array<int64_t, 3>, std::pair<std::array<double, 3>, int64_t>> bins;
++            for (const auto& p : pts) {
++                std::array<int64_t, 3> key;
++                for (int i = 0; i < 3; ++i) {
++                    key[i] = static_cast<int64_t>(std::nearbyint(p[i] / BIN_SIZE));
++                }
++                auto& bin = bins[key];
++                for (int i = 0; i < 3; ++i) {
++                    bin.first[i] += p[i];
++                }
++                bin.second += 1;
++            }
++            std::vector<std::array<double, 3>> means;
++            std::vector<int64_t> counts;
++            for (const auto& [key, bin] : bins) {
++                means.push_back({bin.first[0] / bin.second, bin.first[1] / bin.second, bin.first[2] / bin.second});
++                counts.push_back(bin.second);
++            }
++            std::vector<size_t> order(means.size());
++            std::iota(order.begin(), order.end(), 0);
++            std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return counts[a] > counts[b]; });
++            std::vector<std::array<double, 3>> centres;
++            for (size_t i : order) {
++                const auto& c = means[i];
++                double nearest = INFINITY;
++                for (const auto& k : centres) {
++                    nearest = std::min(nearest, std::sqrt((k[0] - c[0]) * (k[0] - c[0]) + (k[1] - c[1]) * (k[1] - c[1]) + (k[2] - c[2]) * (k[2] - c[2])));
++                }
++                if (centres.empty() || nearest > MERGE) {
++                    centres.push_back(c);
++                    if (static_cast<int>(centres.size()) >= MAX_COLOURS) {
++                        break;
++                    }
++                }
++            }
++            for (int it = 0; it < KMEANS_ITERS; ++it) {
++                std::vector<std::array<double, 3>> sums(centres.size(), {0, 0, 0});
++                std::vector<int64_t> n(centres.size(), 0);
++                for (const auto& p : pts) {
++                    size_t best_k = 0;
++                    double best_d = INFINITY;
++                    for (size_t k = 0; k < centres.size(); ++k) {
++                        double d = 0;
++                        for (int i = 0; i < 3; ++i) {
++                            d += (p[i] - centres[k][i]) * (p[i] - centres[k][i]);
++                        }
++                        if (d < best_d) {
++                            best_d = d;
++                            best_k = k;
++                        }
++                    }
++                    for (int i = 0; i < 3; ++i) {
++                        sums[best_k][i] += p[i];
++                    }
++                    n[best_k] += 1;
++                }
++                std::vector<std::array<double, 3>> next;
++                for (size_t k = 0; k < centres.size(); ++k) {
++                    if (n[k] > 0) {
++                        next.push_back({sums[k][0] / n[k], sums[k][1] / n[k], sums[k][2] / n[k]});
++                    }
++                }
++                centres = next;
++            }
++            std::set<RGB> unique;
++            for (const auto& c : centres) {
++                unique.insert(oklab_to_srgb(static_cast<float>(c[0]), static_cast<float>(c[1]), static_cast<float>(c[2])));
++            }
++            return {unique.begin(), unique.end()};
++        }
++
++        // "#aabbcc,#abc,..." -> sorted unique colours (at most 256).
++        std::vector<RGB> parse_palette(const char* text) {
++            std::set<RGB> colours;
++            if (text == nullptr) {
++                return {};
++            }
++            std::string all(text), item;
++            auto flush = [&]() {
++                std::string h;
++                for (char ch : item) {
++                    if (std::isxdigit(static_cast<unsigned char>(ch))) {
++                        h += ch;
++                    }
++                }
++                item.clear();
++                if (h.size() == 3) {
++                    h = std::string{h[0], h[0], h[1], h[1], h[2], h[2]};
++                }
++                if (h.size() != 6) {
++                    return;
++                }
++                colours.insert({static_cast<int>(std::strtol(h.substr(0, 2).c_str(), nullptr, 16)),
++                                static_cast<int>(std::strtol(h.substr(2, 2).c_str(), nullptr, 16)),
++                                static_cast<int>(std::strtol(h.substr(4, 2).c_str(), nullptr, 16))});
++            };
++            for (char ch : all) {
++                if (ch == ',' || ch == ';' || ch == ' ' || ch == ':') {
++                    flush();
++                } else {
++                    item += ch;
++                }
++            }
++            flush();
++            std::vector<RGB> out(colours.begin(), colours.end());
++            if (out.size() > MAX_PALETTE) {
++                out.resize(MAX_PALETTE);
++            }
++            return out;
++        }
++
++        // A palette as the network takes it, plus each slot's value in model space (index 0 = transparent).
++        struct Palette {
++            std::vector<RGB> colours;
++            sd::Tensor<float> feats;
++            sd::Tensor<int32_t> ramp;
++            sd::Tensor<float> level;
++            std::vector<std::array<float, 4>> model_space;
++
++            bool empty() const { return colours.empty(); }
++        };
++
++        Palette make_palette(std::vector<RGB> colours) {
++            Palette pal;
++            pal.colours     = std::move(colours);
++            const int64_t P = static_cast<int64_t>(pal.colours.size());
++            if (P == 0) {
++                return pal;
++            }
++            std::vector<std::array<float, 3>> lab64;
++            for (const auto& c : pal.colours) {
++                lab64.push_back(oklab_f64(c));
++            }
++            std::vector<int> ramp;
++            std::vector<float> level;
++            palette_ramps(lab64, ramp, level);
++            pal.feats = sd::Tensor<float>::zeros({RDFlow::COLOUR_FEATS, P});
++            pal.ramp  = sd::Tensor<int32_t>::zeros({P});
++            pal.level = sd::Tensor<float>::zeros({1, P});
++            pal.model_space.push_back({0.f, 0.f, 0.f, -1.f});
++            for (int64_t p = 0; p < P; ++p) {
++                auto lab = oklab_f32(pal.colours[p]);
++                float* f = pal.feats.data() + p * RDFlow::COLOUR_FEATS;
++                for (int i = 0; i < 3; ++i) {
++                    f[i] = lab[i];
++                    for (int k = 0; k < RDFlow::COLOUR_FREQS; ++k) {
++                        float freq = static_cast<float>(1 << k) * static_cast<float>(PI);
++                        float a    = lab[i] * freq;
++                        f[3 + i * RDFlow::COLOUR_FREQS + k]                              = std::sin(a);
++                        f[3 + 3 * RDFlow::COLOUR_FREQS + i * RDFlow::COLOUR_FREQS + k] = std::cos(a);
++                    }
++                }
++                pal.ramp.data()[p]  = std::min(std::max(ramp[p], 0), RDFlow::N_RAMPS - 1);
++                pal.level.data()[p] = level[p];
++                pal.model_space.push_back({2.f * lab[0] - 1.f, lab[1] * AB_SCALE, lab[2] * AB_SCALE, 1.f});
++            }
++            return pal;
++        }
++
++        // Softmax over (transparent, palette slots) per pixel; returns probabilities [N_PIX * K] and the expected
++        // model-space value [N_PIX * 4].
++        void pointer_expectation(const float* logits, const Palette& pal, std::vector<float>& probs, std::vector<float>& expected) {
++            const size_t K = pal.colours.size() + 1;
++            probs.assign(N_PIX * K, 0.f);
++            expected.assign(N_PIX * 4, 0.f);
++            for (int q = 0; q < N_PIX; ++q) {
++                const float* lg = logits + q * K;
++                float mx        = *std::max_element(lg, lg + K);
++                double sum      = 0;
++                for (size_t k = 0; k < K; ++k) {
++                    probs[q * K + k] = std::exp(lg[k] - mx);
++                    sum += probs[q * K + k];
++                }
++                for (size_t k = 0; k < K; ++k) {
++                    probs[q * K + k] = static_cast<float>(probs[q * K + k] / sum);
++                    for (int j = 0; j < 4; ++j) {
++                        expected[q * 4 + j] += probs[q * K + k] * pal.model_space[k][j];
++                    }
++                }
++            }
++        }
++
++        float bf16_round(float v) {
++            uint32_t u;
++            std::memcpy(&u, &v, sizeof(u));
++            if ((u & 0x7f800000u) != 0x7f800000u) {
++                u += 0x7fffu + ((u >> 16) & 1u);
++            }
++            u &= 0xffff0000u;
++            std::memcpy(&v, &u, sizeof(v));
++            return v;
++        }
++
++        // The prompt reader's features: per-token RMS normalisation without weight, rounded to bf16.
++        sd::Tensor<float> normalise_text(const sd::Tensor<float>& hidden) {
++            const int64_t D = hidden.shape()[0];
++            const int64_t L = hidden.shape()[1];
++            sd::Tensor<float> out({D, L});
++            for (int64_t i = 0; i < L; ++i) {
++                const float* h = hidden.data() + i * D;
++                double ss      = 0;
++                for (int64_t d = 0; d < D; ++d) {
++                    ss += static_cast<double>(h[d]) * h[d];
++                }
++                float inv = 1.f / std::sqrt(static_cast<float>(ss / D) + FLT_EPSILON);
++                for (int64_t d = 0; d < D; ++d) {
++                    out.data()[i * D + d] = bf16_round(h[d] * inv);
++                }
++            }
++            return out;
++        }
++
++        // torch.linspace(0, 1, steps + 1) then t / (t + shift * (1 - t)), in float32.
++        std::vector<float> time_grid(int steps) {
++            std::vector<float> ts(steps + 1);
++            const float step = 1.f / static_cast<float>(steps);
++            const int half   = (steps + 1) / 2;
++            for (int i = 0; i <= steps; ++i) {
++                ts[i] = i < half ? step * static_cast<float>(i) : 1.f - step * static_cast<float>(steps - i);
++            }
++            for (auto& t : ts) {
++                t = t / (t + FLOW_SHIFT * (1.f - t));
++            }
++            return ts;
++        }
++
++        struct SampleResult {
++            std::vector<RGB> colours;
++            std::vector<int> tokens;
++        };
++
++        class Sampler {
++        public:
++            Sampler(StableDiffusionGGML* sd, RDFlow::RDFlowRunner* runner, bool transparent, int steps, float guidance)
++                : sd_(sd), runner_(runner), transparent_(transparent), steps_(steps), guidance_(guidance) {}
++
++            bool sample(std::vector<float> x, const std::vector<RGB>& locked, SampleResult& result) {
++                Palette pal = locked.empty() ? Palette{} : make_palette(locked);
++                std::vector<float> x_hat, sc(N_PIX * 4, 0.f), probs;
++                const auto ts = time_grid(steps_);
++                for (int i = 0; i < steps_; ++i) {
++                    const float t = ts[i], t2 = ts[i + 1];
++                    if (pal.empty() && t >= PALETTE_AT && !x_hat.empty()) {
++                        pal = make_palette(extract_palette(x_hat));
++                    }
++                    const bool guide   = guidance_ != 1.f && GUIDE_FROM <= t && t <= GUIDE_UNTIL;
++                    const bool pointer = !pal.empty() && t >= POINTER_FROM;
++                    std::vector<float> cond_out, uncond_out;
++                    if (!call(x, sc, t, true, pal, cond_out) || (guide && !call(x, sc, t, false, pal, uncond_out))) {
++                        return false;
++                    }
++                    x_hat.assign(N_PIX * 4, 0.f);
++                    for (int k = 0; k < N_PIX * 4; ++k) {
++                        x_hat[k] = guide ? uncond_out[k] + guidance_ * (cond_out[k] - uncond_out[k]) : cond_out[k];
++                    }
++                    if (pointer) {
++                        std::vector<float> expected, uncond_probs, uncond_expected;
++                        pointer_expectation(cond_out.data() + N_PIX * 4, pal, probs, expected);
++                        if (guide) {
++                            pointer_expectation(uncond_out.data() + N_PIX * 4, pal, uncond_probs, uncond_expected);
++                            for (int k = 0; k < N_PIX * 4; ++k) {
++                                expected[k] = uncond_expected[k] + guidance_ * (expected[k] - uncond_expected[k]);
++                            }
++                        }
++                        if (t >= COMMIT_FROM) {
++                            commit(probs, pal, expected);
++                        }
++                        x_hat = expected;
++                    }
++                    sc              = x_hat;
++                    const float den = std::max(1.f - t, 1e-4f);
++                    for (int k = 0; k < N_PIX * 4; ++k) {
++                        x[k] = x[k] + (t2 - t) * (x_hat[k] - x[k]) / den;
++                    }
++                    sd_->generation_progress.report("sampling", "rd_flow", i + 1, steps_, "steps");
++                }
++                if (pal.empty() || probs.empty()) {
++                    LOG_ERROR("RD Flow 64 finished without a palette");
++                    return false;
++                }
++                result.colours = pal.colours;
++                result.tokens  = argmax_tokens(probs, pal.colours.size() + 1);
++                return true;
++            }
++
++        private:
++            bool call(const std::vector<float>& x, const std::vector<float>& sc, float t, bool conditional, const Palette& pal, std::vector<float>& out) {
++                RDFlow::CallInputs in;
++                in.x           = sd::Tensor<float>({RDFlow::CHANNELS, RDFlow::SIZE, RDFlow::SIZE}, x);
++                in.sc          = sd::Tensor<float>({RDFlow::CHANNELS, RDFlow::SIZE, RDFlow::SIZE}, sc);
++                in.t           = t;
++                in.conditional = conditional;
++                in.transparent = transparent_;
++                if (!pal.empty()) {
++                    in.pal_feats = pal.feats;
++                    in.pal_ramp  = pal.ramp;
++                    in.pal_level = pal.level;
++                }
++                auto result = runner_->run(sd_->n_threads, in);
++                if (result.empty()) {
++                    LOG_ERROR("RD Flow 64 network call failed");
++                    return false;
++                }
++                out.assign(result.data(), result.data() + result.numel());
++                return true;
++            }
++
++            static void commit(const std::vector<float>& probs, const Palette& pal, std::vector<float>& expected) {
++                const size_t K = pal.colours.size() + 1;
++                for (int q = 0; q < N_PIX; ++q) {
++                    const float* p = probs.data() + q * K;
++                    size_t best    = static_cast<size_t>(std::max_element(p, p + K) - p);
++                    if (p[best] >= COMMIT_THRESH) {
++                        for (int j = 0; j < 4; ++j) {
++                            expected[q * 4 + j] = pal.model_space[best][j];
++                        }
++                    }
++                }
++            }
++
++            static std::vector<int> argmax_tokens(const std::vector<float>& probs, size_t K) {
++                std::vector<int> tokens(N_PIX);
++                for (int q = 0; q < N_PIX; ++q) {
++                    const float* p = probs.data() + q * K;
++                    tokens[q]      = static_cast<int>(std::max_element(p, p + K) - p);
++                }
++                return tokens;
++            }
++
++            StableDiffusionGGML* sd_;
++            RDFlow::RDFlowRunner* runner_;
++            bool transparent_;
++            int steps_;
++            float guidance_;
++        };
++
++        sd_image_t decode_image(const SampleResult& result) {
++            sd_image_t image{RDFlow::SIZE, RDFlow::SIZE, 4, static_cast<uint8_t*>(calloc(N_PIX * 4, 1))};
++            for (int q = 0; q < N_PIX; ++q) {
++                const int token = result.tokens[q];
++                if (token > 0) {
++                    const auto& c        = result.colours[token - 1];
++                    image.data[q * 4 + 0] = static_cast<uint8_t>(c[0]);
++                    image.data[q * 4 + 1] = static_cast<uint8_t>(c[1]);
++                    image.data[q * 4 + 2] = static_cast<uint8_t>(c[2]);
++                    image.data[q * 4 + 3] = 255;
++                }
++            }
++            return image;
++        }
++
++        sd::Tensor<float> encode_prompt(StableDiffusionGGML* sd, const std::string& prompt) {
++            ConditionerRunnerEndOnExit conditioner_runner_end{sd->cond_stage_model.get()};
++            ConditionerParams condition_params;
++            condition_params.text = prompt;
++            sd->generation_progress.report("conditioning", "positive_prompt");
++            auto cond = sd->get_learned_condition(condition_params);
++            if (cond.c_crossattn.empty()) {
++                return {};
++            }
++            return normalise_text(cond.c_crossattn);
++        }
++    }  // namespace
++
++    bool generate_rd_flow(StableDiffusionGGML* sd,
++                          const sd_img_gen_params_t* params,
++                          const GenerationRequest& request,
++                          const nlohmann::json& info,
++                          sd_image_t** images_out,
++                          int* num_images_out,
++                          std::vector<nlohmann::json>* infos_out) {
++        auto runner = std::dynamic_pointer_cast<RDFlow::RDFlowRunner>(sd->diffusion_model);
++        if (runner == nullptr) {
++            LOG_ERROR("RD Flow 64 diffusion model is not loaded");
++            return false;
++        }
++        if (request.width != RDFlow::SIZE || request.height != RDFlow::SIZE) {
++            LOG_WARN("RD Flow 64 draws %dx%d only; ignoring the requested %dx%d", RDFlow::SIZE, RDFlow::SIZE, request.width, request.height);
++        }
++        int64_t t0 = ggml_time_ms();
++        auto text  = encode_prompt(sd, request.prompt);
++        if (text.empty()) {
++            LOG_ERROR("failed to encode prompt");
++            return false;
++        }
++        runner->set_text(text);
++        int64_t t1 = ggml_time_ms();
++        LOG_INFO("RD Flow 64 prompt read (%" PRId64 " tokens) in %.2fs", text.shape()[1], (t1 - t0) / 1000.f);
++
++        const auto locked      = parse_palette(params->palette);
++        const bool transparent = !params->opaque_background;
++        const int steps        = request.sample_params.sample_steps > 0 ? request.sample_params.sample_steps : 16;
++        const float guidance   = request.guidance.txt_cfg;
++        LOG_INFO("RD Flow 64: %d steps, guidance %.2f, %s, palette %s", steps, guidance,
++                 transparent ? "transparent" : "opaque",
++                 locked.empty() ? "chosen by the model" : (std::to_string(locked.size()) + " locked colours").c_str());
++
++        std::vector<sd_image_t> images;
++        Sampler sampler(sd, runner.get(), transparent, steps, guidance);
++        for (int b = 0; b < request.batch_count; ++b) {
++            if (sd->get_cancel_flag() == SD_CANCEL_ALL || sd->get_cancel_flag() == SD_CANCEL_NEW_LATENTS) {
++                break;
++            }
++            sd->rng->manual_seed(request.seed_for_batch(b));
++            std::vector<float> noise = sd->rng->randn(N_PIX * 4);
++            SampleResult result;
++            if (!sampler.sample(std::move(noise), locked, result)) {
++                for (auto& image : images) {
++                    free(image.data);
++                }
++                runner->runner_end();
++                return false;
++            }
++            images.push_back(decode_image(result));
++        }
++        runner->runner_end();
++        LOG_INFO("RD Flow 64 drew %zu image(s) in %.2fs", images.size(), (ggml_time_ms() - t1) / 1000.f);
++
++        auto* out = static_cast<sd_image_t*>(calloc(images.size() > 0 ? images.size() : 1, sizeof(sd_image_t)));
++        std::copy(images.begin(), images.end(), out);
++        if (infos_out) {
++            infos_out->assign(images.size(), info);
++            for (size_t i = 0; i < images.size(); ++i) {
++                (*infos_out)[i]["seed"] = std::to_string(request.seed_for_batch(static_cast<int>(i)));
++            }
++        }
++        if (num_images_out != nullptr) {
++            *num_images_out = static_cast<int>(images.size());
++        }
++        if (images_out != nullptr) {
++            *images_out = out;
++        } else {
++            free_sd_images(out, static_cast<int>(images.size()));
++        }
++        return true;
++    }
++}  // namespace sd::pipeline
+diff --git a/src/pipeline/rd_flow.h b/src/pipeline/rd_flow.h
+new file mode 100644
+index 0000000..ade86c3
+--- /dev/null
++++ b/src/pipeline/rd_flow.h
+@@ -0,0 +1,25 @@
++#ifndef __SD_PIPELINE_RD_FLOW_H__
++#define __SD_PIPELINE_RD_FLOW_H__
++
++#include <vector>
++
++#include "json.hpp"
++#include "stable-diffusion.h"
++
++struct StableDiffusionGGML;
++
++namespace sd::pipeline {
++    struct GenerationRequest;
++
++    // RD Flow 64 text-to-image: its own flow sampler in OKLab + alpha pixel space, finished by the palette pointer,
++    // producing 64x64 RGBA images directly (no denoiser, no VAE).
++    bool generate_rd_flow(StableDiffusionGGML* sd,
++                          const sd_img_gen_params_t* params,
++                          const GenerationRequest& request,
++                          const nlohmann::json& info,
++                          sd_image_t** images_out,
++                          int* num_images_out,
++                          std::vector<nlohmann::json>* infos_out);
++}  // namespace sd::pipeline
++
++#endif  // __SD_PIPELINE_RD_FLOW_H__
+-- 
+2.47.0
+
